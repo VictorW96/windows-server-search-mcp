@@ -18,15 +18,16 @@ jobs:
           - { os: ubuntu-latest, shell: pwsh }
           - { os: windows-latest, shell: pwsh }
           - { os: windows-latest, shell: powershell }
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Pester 5
-        shell: ${{ matrix.shell }}
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
       - name: Run tests
-        shell: ${{ matrix.shell }}
         run: |
           Import-Module Pester -MinimumVersion 5.5.0
           $c = New-PesterConfiguration
