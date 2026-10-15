@@ -39,21 +39,22 @@ so the server sees your mapped drives and Windows credentials.
 
 `read_file`, `list_directory` and `copy_file` only accept source paths inside the discovered or configured shares.
 
-| `save_file` | **Only when enabled:** saves text (`content`) or workspace files to a server folder. No delete, move or rename |
+| `save_file` | Saves text (`content`) or workspace files to a server folder (on by default, can be disabled). No delete, move or rename |
 
-### Writing to servers (`save_file`, off by default)
+### Writing to servers (`save_file`, on by default)
 
-Writing is **disabled unless you turn it on**. When enabled, Claude can save files to every known share
-except blocked paths:
+Writing is **enabled by default**. Claude can save new files to every known share except blocked paths.
+Overwriting existing files stays **off** until `allowOverwrite` is set. To change this:
 
 ```json
 // %APPDATA%\windows-server-search-mcp\config.json  (Cowork)  – or plugin options allow_write / allow_overwrite (Claude Code)
-{ "write": { "enabled": true, "allowOverwrite": true, "maxMB": 100, "logPath": "\\\\fs01\\it\\claude-writes.jsonl" } }
+{ "write": { "enabled": false } }   // either: turn writing off
+{ "write": { "allowOverwrite": true, "maxMB": 100, "logPath": "\\\\fs01\\it\\claude-writes.jsonl" } } // or: allow overwrite + central log
 ```
 
 - **Group Policy veto:** `DisableWrite = 1` (DWORD) under `HKLM\SOFTWARE\Policies\WindowsServerSearchMcp`
   (or HKCU) turns writing off whatever the user configured. The tool then disappears.
-- **Disabled means hidden:** the tool isn't listed at all while writing is disabled. Turning it on takes
+- **Disabled means hidden:** the tool isn't listed at all while writing is disabled. A change takes
   effect in the next session.
 - **Never writable:**
   - blocked paths from the access policy;
@@ -181,7 +182,7 @@ All settings are optional. A PC with mapped network drives works without any con
 | Default maximum results | `maxResults` / `WSS_MAX_RESULTS` | `50` | 1–500 |
 | Download folder | `downloadDir` / `WSS_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads\Windows Server Search` | Default destination for `copy_file` |
 | – | `maxCopyMB` / `WSS_MAX_COPY_MB` | `500` | Maximum size per copied file |
-| Allow writing to servers | `write.enabled` / `WSS_WRITE_ENABLED` | `false` | Enables `save_file` |
+| Allow writing to servers | `write.enabled` / `WSS_WRITE_ENABLED` | `true` | `save_file`; set `false` to disable |
 | Allow overwriting files | `write.allowOverwrite` / `WSS_WRITE_OVERWRITE` | `false` | `overwrite: true` replaces files (with backup) |
 | – | `write.maxMB` / `WSS_WRITE_MAX_MB` | `100` | Maximum size per written file |
 | – | `write.logPath` / `WSS_WRITE_LOG` | `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl` | Write audit log |
@@ -230,7 +231,8 @@ Most of us have no Windows file server at hand, so the tests run in three layers
    The `save_file` checks write to the share and verify the files directly in the server folder. They cover
    numbered copies, overwriting with a backup, and an upload from the workspace. They check that
    executables, blocked folders, `.claude-policy`, foreign local sources and non-share targets are refused,
-   that every write is logged, that the tool is hidden by default, and that the Group Policy veto works.
+   that every write is logged, that the tool is available by default and hidden when disabled, and that the
+   Group Policy veto works.
 
 Run locally (any OS with PowerShell 7 or Docker):
 

@@ -652,9 +652,10 @@ Describe 'save_file' {
         Remove-Item $WBase -Recurse -Force -ErrorAction SilentlyContinue
         & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = $null }
     }
-    It 'is disabled by default and hidden from tools/list' {
+    It 'is enabled by default (overwrite off) and hidden from tools/list when disabled' {
         $c = Get-WssConfig
-        $c.WriteEnabled | Should -BeFalse
+        $c.WriteEnabled | Should -BeTrue
+        $c.WriteAllowOverwrite | Should -BeFalse
         @(Get-WssToolDefinitions | ForEach-Object { $_.name }) | Should -Not -Contain 'save_file'
         @(Get-WssToolDefinitions -IncludeWrite $true | ForEach-Object { $_.name }) | Should -Contain 'save_file'
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
@@ -777,7 +778,7 @@ Describe 'MCP protocol' {
     }
     It 'lists tools with schemas' {
         $r = Invoke-WssMessageLine '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | ConvertFrom-Json
-        @($r.result.tools.name) | Should -Be @('list_servers', 'search_files', 'read_file', 'list_directory', 'copy_file')
+        @($r.result.tools.name) | Should -Be @('list_servers', 'search_files', 'read_file', 'list_directory', 'copy_file', 'save_file')
         ($r.result.tools | Where-Object name -eq 'copy_file').annotations.readOnlyHint | Should -BeFalse
         foreach ($t in $r.result.tools) { $t.inputSchema.type | Should -Be 'object' }
         @(($r.result.tools | Where-Object name -eq 'read_file').inputSchema.required) | Should -Be @('path')

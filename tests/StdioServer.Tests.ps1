@@ -54,7 +54,7 @@ Describe 'stdio server (fake backend)' {
         $lines.Count | Should -Be 4 -Because "stderr was: $LastStderr"
         $msgs = $lines | ForEach-Object { $_ | ConvertFrom-Json }
         $msgs[0].result.serverInfo.name | Should -Be 'windows-server-search'
-        $msgs[1].result.tools.Count | Should -Be 5
+        $msgs[1].result.tools.Count | Should -Be 6
         ($msgs[2].result.content[0].text | ConvertFrom-Json).servers[0].query_machine | Should -Be 'fs01'
         $search = $msgs[3].result.content[0].text | ConvertFrom-Json
         $search.results[0].name | Should -Be 'Ünïcode report.docx'

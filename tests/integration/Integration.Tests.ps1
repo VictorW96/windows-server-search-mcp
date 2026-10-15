@@ -293,19 +293,31 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
 }
 
 Describe 'Write protection defaults' -Skip:$Skip {
-    It 'hides save_file unless enabled' {
-        $m = @(Invoke-Mcp (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @(
+    It 'offers save_file by default and hides it when disabled in the config file' {
+        $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $empty = Join-Path $env:TEMP 'wss-default\config.json'
+        New-Item -ItemType Directory -Path (Split-Path $empty) -Force | Out-Null
+        '{}' | Set-Content -LiteralPath $empty
+        $m = @(Invoke-Mcp $exe @('{"jsonrpc":"2.0","id":1,"method":"tools/list"}') @{ WSS_CONFIG_FILE = $empty })
+        @(($m | Where-Object id -eq 1).result.tools.name) | Should -Contain 'save_file'
+        ($m | Where-Object id -eq 1).result.tools | Where-Object name -eq 'save_file' | ForEach-Object { $_.annotations.destructiveHint | Should -BeFalse }
+
+        $off = Join-Path $env:TEMP 'wss-off\config.json'
+        New-Item -ItemType Directory -Path (Split-Path $off) -Force | Out-Null
+        '{"write":{"enabled":false}}' | Set-Content -LiteralPath $off
+        $m = @(Invoke-Mcp $exe @(
                 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
                 (Call 2 'save_file' @{ destination = "$($Env.Drive)\uploads"; name = 'x.txt'; content = 'x' })
-            ))
+            ) @{ WSS_CONFIG_FILE = $off; WSS_WRITE_ENABLED = 'true' })
         @(($m | Where-Object id -eq 1).result.tools.name) | Should -Not -Contain 'save_file'
         ($m | Where-Object id -eq 2).result.content[0].text | Should -Match 'disabled'
+        Test-Path (Join-Path $Env.Folder 'uploads\x.txt') | Should -BeFalse
     }
-    It 'Group Policy DisableWrite overrides an enabled configuration' {
+    It 'Group Policy DisableWrite overrides the default' {
         $key = 'HKLM:\SOFTWARE\Policies\WindowsServerSearchMcp'
         $cfg = Join-Path $env:TEMP 'wss-veto\config.json'
         New-Item -ItemType Directory -Path (Split-Path $cfg) -Force | Out-Null
-        '{"write":{"enabled":true}}' | Set-Content -LiteralPath $cfg
+        '{}' | Set-Content -LiteralPath $cfg   # default: writing enabled
         New-ItemProperty -Path $key -Name DisableWrite -PropertyType DWord -Value 1 -Force | Out-Null
         try {
             $m = @(Invoke-Mcp (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @(

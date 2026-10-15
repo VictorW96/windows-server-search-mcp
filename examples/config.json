@@ -14,7 +14,7 @@
   "maxResults": 50,
   "downloadDir": "C:\\Users\\me\\Documents\\Claude",
   "write": {
-    "enabled": false,
+    "enabled": true,
     "allowOverwrite": false,
     "maxMB": 100
   }

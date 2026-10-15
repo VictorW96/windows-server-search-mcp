@@ -91,7 +91,7 @@ function Get-WssConfig {
         WSS_POLICY_TTL       seconds to cache share .claude-policy files (default 300)
         WSS_DOWNLOAD_DIR     default local folder for copy_file
         WSS_MAX_COPY_MB      maximum size per copied file in MB (default 500)
-        WSS_WRITE_ENABLED    true|false (default false) - enable save_file (write to servers)
+        WSS_WRITE_ENABLED    true|false (default true) - save_file (write to servers)
         WSS_WRITE_OVERWRITE  true|false (default false) - allow overwriting (old version kept as backup)
         WSS_WRITE_MAX_MB     maximum size per written file in MB (default 100)
         WSS_WRITE_LOG        write log path (default %LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl)
@@ -156,7 +156,7 @@ function Get-WssConfig {
         PolicyTtl      = ConvertTo-WssInt (Pick 'WSS_POLICY_TTL' 'policyTtl') 300 0 86400
         DownloadDir    = (Pick 'WSS_DOWNLOAD_DIR' 'downloadDir')
         MaxCopyMB      = ConvertTo-WssInt (Pick 'WSS_MAX_COPY_MB' 'maxCopyMB') 500 1 102400
-        WriteEnabled   = ConvertTo-WssBool (Pick 'WSS_WRITE_ENABLED' 'writeEnabled') $false
+        WriteEnabled   = ConvertTo-WssBool (Pick 'WSS_WRITE_ENABLED' 'writeEnabled') $true
         WriteAllowOverwrite = ConvertTo-WssBool (Pick 'WSS_WRITE_OVERWRITE' 'writeAllowOverwrite') $false
         WriteMaxMB     = ConvertTo-WssInt (Pick 'WSS_WRITE_MAX_MB' 'writeMaxMB') 100 1 102400
         WriteLogPath   = (Pick 'WSS_WRITE_LOG' 'writeLogPath')
@@ -1498,7 +1498,7 @@ function Copy-WssFiles {
 }
 
 # ---------------------------------------------------------------------------
-# Writing files back to the server (save_file) - disabled unless configured
+# Writing files back to the server (save_file) - enabled by default, can be disabled
 # ---------------------------------------------------------------------------
 
 # Never writable, in addition to the access policy: policy files and executable / script types.
@@ -1677,7 +1677,7 @@ function Save-WssFiles {
     param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig), $Targets = $null)
     $status = Get-WssWriteStatus $Config
     if ($status.disabled_by_group_policy) { throw 'Writing to servers is disabled by Group Policy (DisableWrite).' }
-    if (-not $status.enabled) { throw 'Writing to servers is disabled. Enable it in the plugin configuration ("write": { "enabled": true }).' }
+    if (-not $status.enabled) { throw 'Writing to servers is disabled in the plugin configuration ("write": { "enabled": false }).' }
     if ($null -eq $Targets) { $Targets = @(Get-WssTargets -Config $Config) }
 
     if (-not $Arguments.destination) { throw 'destination (server folder, e.g. Z:\Reports or \\server\share\Reports) is required.' }

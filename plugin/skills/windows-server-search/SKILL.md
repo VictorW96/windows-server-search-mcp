@@ -34,16 +34,16 @@ The `windows-server-search` MCP server queries the **Windows Search index of the
    Outside Cowork, pass `destination` as a Windows folder path instead. Existing files are never
    overwritten unless `overwrite: true`; a numbered copy (`report (1).pdf`) is created instead.
 
-6. **`save_file`** – only present when writing to servers is enabled. Saves text you write (`content` + `name`)
+6. **`save_file`** – available unless writing was disabled. Saves text you write (`content` + `name`)
    or files from your workspace (`source_marker` + `source_name(s)`) into a server folder (`destination`).
    - Only save when the user asked you to, and tell them the exact path you saved to.
    - Existing files are never replaced unless you pass `overwrite: true` (only if the user wants the file
      replaced); the old version is then kept as `<name>.claude-backup-<timestamp>`. Otherwise a numbered copy
      is created – mention the new name.
    - Blocked paths, `.claude-policy` files and programs/scripts (`.exe`, `.ps1`, …) can't be written.
-   - If the user asks to save to the server and the tool is missing, writing is disabled: in Cowork it is
-     enabled in `%APPDATA%\windows-server-search-mcp\config.json` with `"write": { "enabled": true }`
-     (plus `"allowOverwrite": true` to allow replacing files). IT can disable it via Group Policy.
+   - If the tool is missing, writing was disabled by the user (`"write": { "enabled": false }` in
+     `%APPDATA%\windows-server-search-mcp\config.json`) or by IT (Group Policy). Replacing existing files
+     additionally needs `"allowOverwrite": true` in that file.
 
 Always show the user the **drive path** (e.g. `Z:\Projects\Plan.docx`) when available, otherwise the UNC path,
 so they can open the file themselves.
