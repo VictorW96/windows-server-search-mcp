@@ -34,7 +34,7 @@ BeforeAll {
     function Get-TestSql { & $script:Mod { @($script:TestSql) } }
     function New-TestConfig {
         param($Servers = @(), $AutoDiscover = $true, $Exclude = @(), $MaxResults = 50, $Deny = @())
-        @{ Servers = @($Servers); AutoDiscover = $AutoDiscover; Exclude = @($Exclude); MaxResults = $MaxResults; QueryTimeout = 5; UseNetBios = $true; Deny = @($Deny); PolicyTtl = 0; MaxCopyMB = 500 }
+        @{ Servers = @($Servers); AutoDiscover = $AutoDiscover; Exclude = @($Exclude); MaxResults = $MaxResults; QueryTimeout = 5; UseNetBios = $true; Deny = @($Deny); PolicyTtl = 0; MaxCopyMB = 500; WriteEnabled = $false; WriteAllowOverwrite = $false; WriteMaxMB = 100 }
     }
 }
 
@@ -639,6 +639,123 @@ Describe 'Access policy: sources and enforcement' {
         $r.access_policy.rule_counts['share-policy'] | Should -Be 2
         $r.access_policy.policy_files[0].share | Should -Be '\\fs01\data'
         ($r.servers[0].shares | Where-Object name -eq 'hr').blocked_by_policy | Should -Match 'group-policy'
+    }
+}
+
+Describe 'save_file' {
+    BeforeAll {
+        $script:WBase = Join-Path ([IO.Path]::GetTempPath()) "wss-write-$([guid]::NewGuid())"
+        New-Item -ItemType Directory -Path $WBase -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $WBase 'src.txt') -Value 'SOURCE'
+    }
+    AfterAll {
+        Remove-Item $WBase -Recurse -Force -ErrorAction SilentlyContinue
+        & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = $null }
+    }
+    It 'is disabled by default and hidden from tools/list' {
+        $c = Get-WssConfig
+        $c.WriteEnabled | Should -BeFalse
+        @(Get-WssToolDefinitions | ForEach-Object { $_.name }) | Should -Not -Contain 'save_file'
+        @(Get-WssToolDefinitions -IncludeWrite $true | ForEach-Object { $_.name }) | Should -Contain 'save_file'
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        { Save-WssFiles -Arguments @{ destination = 'Z:\x'; name = 'a.txt'; content = 'x' } -Config (New-TestConfig) } | Should -Throw '*disabled*'
+    }
+    It 'can be enabled via the nested "write" object in the config file' {
+        $f = Join-Path $WBase 'cfg.json'
+        '{"write":{"enabled":true,"allowOverwrite":true,"maxMB":5,"logPath":"C:\\log.jsonl"}}' | Set-Content -LiteralPath $f
+        $env:WSS_CONFIG_FILE = $f
+        $env:WSS_WRITE_ENABLED = 'false'   # what the plugin default passes
+        try {
+            $c = Get-WssConfig
+            $c.WriteEnabled | Should -BeTrue
+            $c.WriteAllowOverwrite | Should -BeTrue
+            $c.WriteMaxMB | Should -Be 5
+            $c.WriteLogPath | Should -Be 'C:\log.jsonl'
+        } finally { Remove-Item env:WSS_CONFIG_FILE, env:WSS_WRITE_ENABLED -ErrorAction SilentlyContinue }
+    }
+    It 'Group Policy veto wins over the configuration' {
+        & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = { $true } }
+        $cfg = New-TestConfig; $cfg.WriteEnabled = $true
+        $st = Get-WssWriteStatus $cfg
+        $st.enabled | Should -BeFalse
+        $st.disabled_by_group_policy | Should -BeTrue
+        { Save-WssFiles -Arguments @{ destination = 'Z:\x'; name = 'a.txt'; content = 'x' } -Config $cfg } | Should -Throw '*Group Policy*'
+        & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = { $false } }
+    }
+    It 'writes content atomically and never leaves temp files' {
+        $d = Join-Path $WBase 'out1'
+        $r = Save-WssOneFile -TargetDir $d -Name 'summary.md' -Content "# Grüße"
+        $r.target | Should -Be (Join-Path $d 'summary.md')
+        [IO.File]::ReadAllText($r.target) | Should -Be '# Grüße'
+        $r.overwritten | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $d -Force | Where-Object Name -like '.~claude-upload-*').Count | Should -Be 0
+    }
+    It 'creates numbered copies instead of overwriting' {
+        $d = Join-Path $WBase 'out1'
+        $r = Save-WssOneFile -TargetDir $d -Name 'summary.md' -Content 'second'
+        $r.renamed_to | Should -Be 'summary (1).md'
+        [IO.File]::ReadAllText((Join-Path $d 'summary.md')) | Should -Be '# Grüße'
+    }
+    It 'overwrites with a backup of the previous version' {
+        $d = Join-Path $WBase 'out1'
+        $r = Save-WssOneFile -TargetDir $d -Name 'summary.md' -Content 'third' -Overwrite $true
+        $r.overwritten | Should -BeTrue
+        [IO.File]::ReadAllText($r.target) | Should -Be 'third'
+        $r.backup | Should -Match 'summary\.md\.claude-backup-\d{8}-\d{6}$'
+        [IO.File]::ReadAllText($r.backup) | Should -Be '# Grüße'
+    }
+    It 'copies source files and supports encodings and size limits' {
+        $d = Join-Path $WBase 'out2'
+        $r = Save-WssOneFile -TargetDir $d -Name 'copy.txt' -SourceFile (Join-Path $WBase 'src.txt')
+        (Get-Content -LiteralPath $r.target) | Should -Be 'SOURCE'
+        $r2 = Save-WssOneFile -TargetDir $d -Name 'bom.csv' -Content 'a;b' -Encoding 'utf8-bom'
+        [IO.File]::ReadAllBytes($r2.target)[0..2] | Should -Be @(0xEF, 0xBB, 0xBF)
+        { Save-WssOneFile -TargetDir $d -Name 'big.txt' -Content ('x' * 100) -MaxBytes 10 } | Should -Throw '*write limit*'
+        { Save-WssOneFile -TargetDir $d -Name 'e.txt' -Content 'x' -Encoding 'latin1' } | Should -Throw '*Invalid encoding*'
+    }
+    It 'validates file names: <name>' -TestCases @(
+        @{ name = 'a/b.txt' }, @{ name = '..\x.txt' }, @{ name = 'CON' }, @{ name = 'nul.txt' }, @{ name = 'x.txt.' }, @{ name = 'a:b' }, @{ name = '' }
+    ) {
+        { Test-WssFileName $name } | Should -Throw
+    }
+    It 'blocks policy files, executables and denied paths as targets' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' }) -Policies @{ '\\fs01\p' = @{ Status = 'ok'; Content = 'secret' } }
+        $cfg = New-TestConfig
+        $t = @(Get-WssTargets -Config $cfg)
+        $pol = Get-WssPolicy -Config $cfg -Targets $t
+        $wr = Get-WssWriteRules
+        { Assert-WssWritable '\\fs01\p\.claude-policy' $pol $wr } | Should -Throw '*not allowed*'
+        { Assert-WssWritable '\\fs01\p\sub\Tool.EXE' $pol $wr } | Should -Throw '*not allowed*'
+        { Assert-WssWritable '\\fs01\p\run.ps1' $pol $wr } | Should -Throw '*not allowed*'
+        { Assert-WssWritable '\\fs01\p\secret\a.txt' $pol $wr } | Should -Throw '*access policy*'
+        { Assert-WssWritable '\\fs01\p\x\vault.kdbx' $pol $wr } | Should -Throw '*access policy*'
+        { Assert-WssWritable '\\fs01\p\reports\summary.md' $pol $wr } | Should -Not -Throw
+    }
+    It 'only reads local sources from the workspace or download folder' {
+        $roots = @((Join-Path $WBase 'ws'))
+        New-Item -ItemType Directory -Path (Join-Path $WBase 'ws') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $WBase 'ws/ok.txt') -Value 'ok'
+        Resolve-WssSaveSource (Join-Path $WBase 'ws/ok.txt') $roots | Should -Be ([IO.Path]::GetFullPath((Join-Path $WBase 'ws/ok.txt')))
+        { Resolve-WssSaveSource (Join-Path $WBase 'src.txt') $roots } | Should -Throw '*outside the folders*'
+        { Resolve-WssSaveSource (Join-Path $WBase 'ws/../src.txt') $roots } | Should -Throw '*outside the folders*'
+        { Resolve-WssSaveSource (Join-Path $WBase 'ws/missing.txt') $roots } | Should -Throw '*not found*'
+    }
+    It 'requires a destination and a source' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        $cfg = New-TestConfig; $cfg.WriteEnabled = $true
+        & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = { $false } }
+        { Save-WssFiles -Arguments @{ name = 'a.txt'; content = 'x' } -Config $cfg } | Should -Throw '*destination*'
+        { Save-WssFiles -Arguments @{ destination = 'Z:\x' } -Config $cfg } | Should -Throw '*Provide content*'
+        { Save-WssFiles -Arguments @{ destination = 'Z:\x'; content = 'x' } -Config $cfg } | Should -Throw '*name is required*'
+        { Save-WssFiles -Arguments @{ destination = 'Z:\x'; source_name = 'a.txt' } -Config $cfg } | Should -Throw '*source_marker*'
+        { Save-WssFiles -Arguments @{ destination = 'C:\local'; name = 'a.txt'; content = 'x' } -Config $cfg } | Should -Throw '*not a mapped drive*'
+    }
+    It 'reports write status in list_servers' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        $cfg = New-TestConfig; $cfg.WriteEnabled = $true; $cfg.WriteAllowOverwrite = $true
+        $r = Get-WssServerList -Arguments @{} -Config $cfg
+        $r.write.enabled | Should -BeTrue
+        $r.write.allow_overwrite | Should -BeTrue
     }
 }
 

@@ -62,6 +62,12 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         New-Item -ItemType Directory -Path $Workspace -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $Workspace $Marker) -Value ''
         $script:CopyDir = Join-Path $env:TEMP ("wss-copy-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        # Writing enabled through the (nested) config file, with overwrite + a dedicated log
+        $script:Run = [guid]::NewGuid().ToString('N').Substring(0, 6)
+        $script:UploadRel = "uploads\run-$Run"
+        $script:WriteLog = Join-Path $env:TEMP "wss-write-$Run.jsonl"
+        $script:CfgFile = Join-Path $env:TEMP "wss-config-$Run.json"
+        @{ write = @{ enabled = $true; allowOverwrite = $true; logPath = $WriteLog } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $CfgFile -Encoding UTF8
         $script:Msgs = @(Invoke-Mcp $Exe @(
                 (Call 1 'list_servers' @{ check = $true }),
                 (Call 2 'search_files' @{ query = $Env.Token }),
@@ -81,8 +87,18 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
                 (Call 16 'read_file' @{ path = "$($Env.Drive)\$(if ($Env.ShortName) { $Env.ShortName } else { 'Confidential Documents' })\doc.txt" }),
                 (Call 17 'read_file' @{ path = "$($Env.Drive)\$(if ($Env.Symlink) { $Env.Symlink } else { 'secret' })\plan.txt" }),
                 (Call 18 'copy_file' @{ path = "$($Env.Drive)\regblocked.txt"; destination = $CopyDir }),
-                (Call 19 'list_directory' @{ path = "$($Env.Drive)\secret" })
-            ))
+                (Call 19 'list_directory' @{ path = "$($Env.Drive)\secret" }),
+                (Call 20 'save_file' @{ destination = "$($Env.Drive)\$UploadRel\sub"; name = 'summary.md'; content = "# Summary $($Env.Token)" }),
+                (Call 21 'save_file' @{ destination = "$($Env.Drive)\$UploadRel\sub"; name = 'summary.md'; content = 'second' }),
+                (Call 22 'save_file' @{ destination = "\\$($Env.Computer)\$($Env.Share)\$UploadRel\sub"; name = 'summary.md'; content = 'third'; overwrite = $true }),
+                (Call 23 'save_file' @{ destination = "$($Env.Drive)\$UploadRel"; source_marker = $Marker; source_names = @('alpha.txt') }),
+                (Call 24 'save_file' @{ destination = "$($Env.Drive)\$UploadRel"; name = 'evil.exe'; content = 'MZ' }),
+                (Call 25 'save_file' @{ destination = "$($Env.Drive)\secret"; name = 'x.txt'; content = 'x' }),
+                (Call 26 'save_file' @{ destination = "$($Env.Drive)\"; name = '.claude-policy'; content = '' }),
+                (Call 27 'save_file' @{ destination = "$($Env.Drive)\$UploadRel"; source_path = 'C:\Windows\win.ini' }),
+                (Call 28 'save_file' @{ destination = 'C:\Temp'; name = 'x.txt'; content = 'x' }),
+                '{"jsonrpc":"2.0","id":29,"method":"tools/list"}'
+            ) @{ WSS_CONFIG_FILE = $CfgFile })
     }
 
     It 'auto-discovers the mapped drive as a Windows server' {
@@ -209,8 +225,94 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         ($Msgs | Where-Object id -eq 19).result.isError | Should -BeTrue
     }
 
+    It 'lists save_file when writing is enabled' {
+        $t = ($Msgs | Where-Object id -eq 29).result.tools
+        @($t.name) | Should -Contain 'save_file'
+        ($t | Where-Object name -eq 'save_file').annotations.destructiveHint | Should -BeTrue
+        (Get-ToolJson ($Msgs | Where-Object id -eq 1)).write.enabled | Should -BeTrue
+    }
+
+    It 'writes inline content to the server (verified on the server folder)' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 20)
+        $r.saved[0].drive_path | Should -Be "$($Env.Drive)\$UploadRel\sub\summary.md"
+        $onServer = Join-Path $Env.Folder "$UploadRel\sub\summary.md"
+        # call 22 overwrote it later; the backup holds this version
+        Test-Path -LiteralPath $onServer | Should -BeTrue
+    }
+
+    It 'creates a numbered copy instead of overwriting' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 21)
+        $r.saved[0].renamed_to | Should -Be 'summary (1).md'
+        Get-Content -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub\summary (1).md") -Raw | Should -Match 'second'
+    }
+
+    It 'overwrites with a backup when allowed' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 22)
+        $r.saved[0].overwritten | Should -BeTrue
+        Get-Content -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub\summary.md") -Raw | Should -Match 'third'
+        $backup = Get-ChildItem -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub") -Filter 'summary.md.claude-backup-*'
+        @($backup).Count | Should -Be 1
+        Get-Content -LiteralPath $backup[0].FullName -Raw | Should -Match $Env.Token
+        @(Get-ChildItem -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub") -Force -Filter '.~claude-upload-*').Count | Should -Be 0
+    }
+
+    It 'uploads a file from the Cowork workspace (marker)' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 23)
+        $r.saved[0].target | Should -BeLike "*\$UploadRel\alpha.txt"
+        Get-Content -LiteralPath (Join-Path $Env.Folder "$UploadRel\alpha.txt") -Raw | Should -Match $Env.Token
+    }
+
+    It 'refuses executables, blocked folders, policy files, foreign sources and non-share targets' {
+        $expect = @{ 24 = 'not allowed'; 25 = 'access policy'; 26 = 'not allowed'; 27 = 'outside the folders'; 28 = 'not a mapped drive' }
+        foreach ($id in $expect.Keys) {
+            $m = $Msgs | Where-Object id -eq $id
+            $m.result.isError | Should -BeTrue -Because "request $id"
+            $m.result.content[0].text | Should -Match $expect[$id] -Because "request $id"
+        }
+        Test-Path (Join-Path $Env.Folder "$UploadRel\evil.exe") | Should -BeFalse
+        Test-Path (Join-Path $Env.Folder 'secret\x.txt') | Should -BeFalse
+        (Get-Content -LiteralPath (Join-Path $Env.Folder '.claude-policy') -Raw) | Should -Match 'secret/'
+    }
+
+    It 'logs every write' {
+        $lines = @(Get-Content -LiteralPath $WriteLog | ForEach-Object { $_ | ConvertFrom-Json })
+        $lines.Count | Should -Be 4
+        ($lines | Where-Object overwritten).Count | Should -Be 1
+        $lines[0].user | Should -Match $env:USERNAME
+    }
+
     It 'refuses to read local files outside the server shares' {
         $m = $Msgs | Where-Object id -eq 8
         $m.result.isError | Should -BeTrue
+    }
+}
+
+Describe 'Write protection defaults' -Skip:$Skip {
+    It 'hides save_file unless enabled' {
+        $m = @(Invoke-Mcp (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @(
+                '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                (Call 2 'save_file' @{ destination = "$($Env.Drive)\uploads"; name = 'x.txt'; content = 'x' })
+            ))
+        @(($m | Where-Object id -eq 1).result.tools.name) | Should -Not -Contain 'save_file'
+        ($m | Where-Object id -eq 2).result.content[0].text | Should -Match 'disabled'
+    }
+    It 'Group Policy DisableWrite overrides an enabled configuration' {
+        $key = 'HKLM:\SOFTWARE\Policies\WindowsServerSearchMcp'
+        $cfg = Join-Path $env:TEMP 'wss-veto.json'
+        '{"write":{"enabled":true}}' | Set-Content -LiteralPath $cfg
+        New-ItemProperty -Path $key -Name DisableWrite -PropertyType DWord -Value 1 -Force | Out-Null
+        try {
+            $m = @(Invoke-Mcp (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @(
+                    '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                    (Call 2 'save_file' @{ destination = "$($Env.Drive)\uploads"; name = 'veto.txt'; content = 'x' }),
+                    (Call 3 'list_servers' @{})
+                ) @{ WSS_CONFIG_FILE = $cfg })
+            @(($m | Where-Object id -eq 1).result.tools.name) | Should -Not -Contain 'save_file'
+            ($m | Where-Object id -eq 2).result.content[0].text | Should -Match 'Group Policy'
+            (Get-ToolJson ($m | Where-Object id -eq 3)).write.disabled_by_group_policy | Should -BeTrue
+            Test-Path (Join-Path $Env.Folder 'uploads\veto.txt') | Should -BeFalse
+        } finally {
+            Remove-ItemProperty -Path $key -Name DisableWrite -ErrorAction SilentlyContinue
+        }
     }
 }

@@ -91,6 +91,10 @@ function Get-WssConfig {
         WSS_POLICY_TTL       seconds to cache share .claude-policy files (default 300)
         WSS_DOWNLOAD_DIR     default local folder for copy_file
         WSS_MAX_COPY_MB      maximum size per copied file in MB (default 500)
+        WSS_WRITE_ENABLED    true|false (default false) - enable save_file (write to servers)
+        WSS_WRITE_OVERWRITE  true|false (default false) - allow overwriting (old version kept as backup)
+        WSS_WRITE_MAX_MB     maximum size per written file in MB (default 100)
+        WSS_WRITE_LOG        write log path (default %LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl)
         WSS_CONFIG_FILE      path to JSON config file (default %APPDATA%\windows-server-search-mcp\config.json)
     #>
     $file = @{}
@@ -102,6 +106,11 @@ function Get-WssConfig {
         try {
             $obj = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
             foreach ($p in $obj.PSObject.Properties) { $file[$p.Name] = $p.Value }
+            # Nested "write": { "enabled", "allowOverwrite", "maxMB", "logPath" }
+            if ($file['write'] -is [System.Management.Automation.PSCustomObject]) {
+                $map = @{ enabled = 'writeEnabled'; allowOverwrite = 'writeAllowOverwrite'; maxMB = 'writeMaxMB'; logPath = 'writeLogPath' }
+                foreach ($p in $file['write'].PSObject.Properties) { if ($map.ContainsKey($p.Name)) { $file[$map[$p.Name]] = $p.Value } }
+            }
         } catch {
             Write-WssLog "Ignoring unreadable config file '$path': $($_.Exception.Message)"
         }
@@ -147,6 +156,10 @@ function Get-WssConfig {
         PolicyTtl      = ConvertTo-WssInt (Pick 'WSS_POLICY_TTL' 'policyTtl') 300 0 86400
         DownloadDir    = (Pick 'WSS_DOWNLOAD_DIR' 'downloadDir')
         MaxCopyMB      = ConvertTo-WssInt (Pick 'WSS_MAX_COPY_MB' 'maxCopyMB') 500 1 102400
+        WriteEnabled   = ConvertTo-WssBool (Pick 'WSS_WRITE_ENABLED' 'writeEnabled') $false
+        WriteAllowOverwrite = ConvertTo-WssBool (Pick 'WSS_WRITE_OVERWRITE' 'writeAllowOverwrite') $false
+        WriteMaxMB     = ConvertTo-WssInt (Pick 'WSS_WRITE_MAX_MB' 'writeMaxMB') 100 1 102400
+        WriteLogPath   = (Pick 'WSS_WRITE_LOG' 'writeLogPath')
         ConfigFile     = $path
     }
 }
@@ -784,6 +797,7 @@ function Get-WssServerList {
             max_results      = $Config.MaxResults
         }
         access_policy = (Get-WssPolicySummary $policy)
+        write         = (Get-WssWriteStatus $Config)
     }
     if ($list.Count -eq 0) {
         $out.hint = 'No servers found. Map a network drive to a Windows file server (net use Z: \\server\share) or configure the "servers" option of the plugin with UNC paths like \\server\share.'
@@ -1484,10 +1498,284 @@ function Copy-WssFiles {
 }
 
 # ---------------------------------------------------------------------------
+# Writing files back to the server (save_file) - disabled unless configured
+# ---------------------------------------------------------------------------
+
+# Never writable, in addition to the access policy: policy files and executable / script types.
+$script:WriteDenyPatterns = @(
+    '**\.claude-policy',
+    '**\*.exe', '**\*.dll', '**\*.com', '**\*.scr', '**\*.msi', '**\*.msp', '**\*.cpl', '**\*.sys', '**\*.drv',
+    '**\*.bat', '**\*.cmd', '**\*.ps1', '**\*.psm1', '**\*.psd1', '**\*.vbs', '**\*.vbe', '**\*.js', '**\*.jse',
+    '**\*.wsf', '**\*.wsh', '**\*.hta', '**\*.lnk', '**\*.url', '**\*.reg', '**\*.jar', '**\*.appx', '**\*.msix',
+    '**\desktop.ini', '**\autorun.inf'
+)
+$script:RegistryWriteVetoProvider = $null   # scriptblock -> $true when IT disabled writing (tests)
+
+function Test-WssWriteVetoed {
+    <# Group Policy / Intune: DisableWrite=1 under HKLM or HKCU \SOFTWARE\Policies\WindowsServerSearchMcp. #>
+    if ($script:RegistryWriteVetoProvider) { return [bool](& $script:RegistryWriteVetoProvider) }
+    if (-not (Test-WssIsWindows)) { return $false }
+    foreach ($key in @('HKLM:\SOFTWARE\Policies\WindowsServerSearchMcp', 'HKCU:\SOFTWARE\Policies\WindowsServerSearchMcp')) {
+        try {
+            $v = (Get-ItemProperty -LiteralPath $key -Name DisableWrite -ErrorAction Stop).DisableWrite
+            if ("$v" -ne '' -and "$v" -ne '0') { return $true }
+        } catch { }
+    }
+    return $false
+}
+
+function Get-WssWriteStatus {
+    param([hashtable]$Config)
+    $veto = Test-WssWriteVetoed
+    return [ordered]@{
+        enabled                  = ([bool]$Config.WriteEnabled -and -not $veto)
+        configured               = [bool]$Config.WriteEnabled
+        disabled_by_group_policy = $veto
+        allow_overwrite          = [bool]$Config.WriteAllowOverwrite
+        max_file_mb              = $Config.WriteMaxMB
+    }
+}
+
+function Test-WssFileName {
+    <# Validates a single Windows file name (no folders). #>
+    param([string]$Name)
+    if (-not $Name -or -not $Name.Trim()) { throw 'File name is empty.' }
+    if ($Name.Length -gt 255) { throw "File name '$Name' is too long." }
+    if ($Name -match '[<>:"/\\|?*\x00-\x1f]') { throw "File name '$Name' contains characters that are not allowed (< > : `" / \ | ? *)." }
+    if ($Name -ne $Name.TrimEnd('.', ' ') -or $Name -ne $Name.TrimStart(' ')) { throw "File name '$Name' must not start with a space or end with a dot or space." }
+    if ($Name -match '^(?i)(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$') { throw "File name '$Name' is reserved by Windows." }
+}
+
+function Get-WssWriteRules {
+    $rules = @()
+    foreach ($p in $script:WriteDenyPatterns) { $rules += New-WssPolicyRule -Pattern $p -Source 'built-in write protection' }
+    return $rules
+}
+
+function Assert-WssWritable {
+    <# Throws if a target path may not be written: access policy or built-in write protection. #>
+    param([string]$TargetUnc, $Policy, $WriteRules)
+    $rule = Test-WssBlocked $TargetUnc $Policy -ExpandShortNames
+    if ($rule) { throw "Writing '$TargetUnc' is blocked by the access policy ($($rule.Source): $($rule.Pattern))." }
+    $c = Get-WssCanonicalUnc $TargetUnc -ExpandShortNames
+    foreach ($r in $WriteRules) {
+        if ($r.Regex.IsMatch($c)) { throw "Writing '$TargetUnc' is not allowed ($($r.Source): $($r.Pattern))." }
+    }
+}
+
+function Get-WssAllowedSourceRoots {
+    <# Local folders that save_file may read from: Cowork workspaces found via marker, download folders. #>
+    param([hashtable]$Config)
+    $roots = @()
+    foreach ($v in $script:WorkspaceCache.Values) { $roots += $v }
+    if ($Config.DownloadDir) { try { $roots += [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables("$($Config.DownloadDir)")) } catch { } }
+    $roots += [IO.Path]::Combine([Environment]::GetFolderPath('UserProfile'), 'Downloads', 'Windows Server Search')
+    return $roots
+}
+
+function Resolve-WssSaveSource {
+    <# Resolves a local source file and checks it lies inside an allowed source root. #>
+    param([string]$Path, [string[]]$Roots)
+    $full = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($Path))
+    if ($full.StartsWith('\\')) { throw "Source '$Path' must be a local file (use the Cowork workspace or the download folder)." }
+    $ok = $false
+    foreach ($r in $Roots) {
+        $root = $r.TrimEnd('\', '/')
+        if ($full.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { $ok = $true }
+    }
+    if (-not $ok) {
+        throw "Source '$Path' is outside the folders save_file may read from (the Cowork workspace located via source_marker, or the download folder)."
+    }
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Source file not found: $full" }
+    return $full
+}
+
+function Save-WssOneFile {
+    <#
+      Writes one file into TargetDir: via a hidden temp file + rename (no partial files).
+      Existing file: numbered copy unless Overwrite, in which case the old version is kept as
+      "<name>.claude-backup-<timestamp>" next to it.
+    #>
+    param(
+        [string]$TargetDir, [string]$Name,
+        [string]$SourceFile, [string]$Content, [string]$Encoding = 'utf8',
+        [bool]$Overwrite = $false, [int64]$MaxBytes = 100MB
+    )
+    Test-WssFileName $Name
+    if ($SourceFile) {
+        $len = (Get-Item -LiteralPath $SourceFile -Force).Length
+        if ($len -gt $MaxBytes) { throw "file is larger than the write limit ($([Math]::Round($MaxBytes / 1MB)) MB)." }
+    } else {
+        switch ($Encoding) {
+            'utf8' { $enc = New-Object Text.UTF8Encoding($false) }
+            'utf8-bom' { $enc = New-Object Text.UTF8Encoding($true) }
+            'utf16' { $enc = [Text.Encoding]::Unicode }
+            default { throw "Invalid encoding '$Encoding' (use utf8, utf8-bom or utf16)." }
+        }
+        $bytes = $enc.GetPreamble() + $enc.GetBytes($Content)
+        if ($bytes.Length -gt $MaxBytes) { throw "content is larger than the write limit ($([Math]::Round($MaxBytes / 1MB)) MB)." }
+    }
+    if (-not (Test-Path -LiteralPath $TargetDir -PathType Container)) { [void](New-Item -ItemType Directory -Path $TargetDir -Force) }
+
+    $tmp = [IO.Path]::Combine($TargetDir, '.~claude-upload-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        if ($SourceFile) { [IO.File]::Copy($SourceFile, $tmp, $false) } else { [IO.File]::WriteAllBytes($tmp, [byte[]]$bytes) }
+        try { [IO.File]::SetAttributes($tmp, [IO.FileAttributes]::Hidden) } catch { }
+
+        $target = [IO.Path]::Combine($TargetDir, $Name)
+        $backup = $null
+        if (Test-Path -LiteralPath $target) {
+            if (Test-Path -LiteralPath $target -PathType Container) { throw "a folder named '$Name' already exists." }
+            if ($Overwrite) {
+                $backup = Get-WssUniquePath $TargetDir ($Name + '.claude-backup-' + (Get-Date).ToString('yyyyMMdd-HHmmss'))
+                [IO.File]::Copy($target, $backup, $false)
+                [IO.File]::Delete($target)
+                try { [IO.File]::Move($tmp, $target) } catch {
+                    # restore the previous version if the rename fails
+                    try { [IO.File]::Copy($backup, $target, $true) } catch { }
+                    throw
+                }
+            } else {
+                $target = Get-WssUniquePath $TargetDir $Name
+                [IO.File]::Move($tmp, $target)
+            }
+        } else {
+            [IO.File]::Move($tmp, $target)
+        }
+        try { [IO.File]::SetAttributes($target, ([IO.File]::GetAttributes($target) -band (-bnot [IO.FileAttributes]::Hidden))) } catch { }
+        if ($SourceFile) { try { [IO.File]::SetLastWriteTimeUtc($target, (Get-Item -LiteralPath $SourceFile).LastWriteTimeUtc) } catch { } }
+        $out = [ordered]@{ target = $target; size = [int64](Get-Item -LiteralPath $target -Force).Length; overwritten = [bool]$backup }
+        if ($backup) { $out.backup = $backup }
+        if ([IO.Path]::GetFileName($target) -ne $Name) { $out.renamed_to = [IO.Path]::GetFileName($target) }
+        return $out
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { try { [IO.File]::Delete($tmp) } catch { } }
+    }
+}
+
+function Write-WssWriteLog {
+    param([hashtable]$Config, $Entry)
+    $path = $Config.WriteLogPath
+    if (-not $path) {
+        $base = $env:LOCALAPPDATA
+        if (-not $base) { $base = [IO.Path]::GetTempPath() }
+        $path = [IO.Path]::Combine($base, 'windows-server-search-mcp', 'write-log.jsonl')
+    }
+    $path = [Environment]::ExpandEnvironmentVariables("$path")
+    $dir = [IO.Path]::GetDirectoryName($path)
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $line = ConvertTo-Json -InputObject $Entry -Depth 5 -Compress
+    $fs = New-Object IO.FileStream($path, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try {
+        $b = (New-Object Text.UTF8Encoding($false)).GetBytes($line + "`n")
+        $fs.Write($b, 0, $b.Length)
+    } finally { $fs.Dispose() }
+    return $path
+}
+
+function Save-WssFiles {
+    param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig), $Targets = $null)
+    $status = Get-WssWriteStatus $Config
+    if ($status.disabled_by_group_policy) { throw 'Writing to servers is disabled by Group Policy (DisableWrite).' }
+    if (-not $status.enabled) { throw 'Writing to servers is disabled. Enable it in the plugin configuration ("write": { "enabled": true }).' }
+    if ($null -eq $Targets) { $Targets = @(Get-WssTargets -Config $Config) }
+
+    if (-not $Arguments.destination) { throw 'destination (server folder, e.g. Z:\Reports or \\server\share\Reports) is required.' }
+    $destUnc = Resolve-WssPath "$($Arguments.destination)" $Targets
+    $policy = Get-WssPolicy -Config $Config -Targets $Targets
+    $writeRules = Get-WssWriteRules
+    Assert-WssWritable $destUnc $policy $writeRules
+
+    # Collect jobs: inline content, or local files from the workspace / download folder.
+    $jobs = @()
+    $hasContent = $Arguments.ContainsKey('content') -and $null -ne $Arguments.content
+    if ($hasContent) {
+        if (-not $Arguments.name) { throw 'name is required when content is given.' }
+        if ("$($Arguments.content)".Length -gt 10000000) { throw 'content is too long (max 10 million characters); save it as a file in the workspace and use source_name.' }
+        $jobs += @{ Label = 'content'; Name = "$($Arguments.name)"; Content = "$($Arguments.content)" }
+    }
+    $sourceDir = $null
+    if ($Arguments.source_marker) { $sourceDir = Find-WssMarkerDirectory -Marker "$($Arguments.source_marker)" }
+    $names = @()
+    if ($Arguments.source_name) { $names += "$($Arguments.source_name)" }
+    if ($Arguments.source_names) { $names += @($Arguments.source_names | ForEach-Object { "$_" }) }
+    if ($names.Count -gt 0 -and -not $sourceDir) { throw 'source_name(s) need source_marker (the marker file in your workspace folder).' }
+    foreach ($n in $names) {
+        if ($n -match '(^|[\\/])\.\.([\\/]|$)' -or [IO.Path]::IsPathRooted($n)) { throw "Invalid source_name '$n' (must be relative to the workspace folder)." }
+        $jobs += @{ Label = $n; Source = [IO.Path]::Combine($sourceDir, $n) }
+    }
+    if ($Arguments.source_path) { $jobs += @{ Label = "$($Arguments.source_path)"; Source = "$($Arguments.source_path)" } }
+    if ($jobs.Count -eq 0) { throw 'Provide content (+ name), source_name(s) with source_marker, or source_path.' }
+    if ($jobs.Count -gt 20) { throw 'At most 20 files can be saved per call.' }
+    if ($Arguments.name -and $jobs.Count -gt 1) { throw 'name can only be used when saving a single file.' }
+
+    $overwrite = ConvertTo-WssBool $Arguments.overwrite $false
+    $notes = @()
+    if ($overwrite -and -not $Config.WriteAllowOverwrite) {
+        $overwrite = $false
+        $notes += 'Overwriting is not allowed by the configuration ("allowOverwrite"); existing files were kept and numbered copies were created instead.'
+    }
+    $roots = Get-WssAllowedSourceRoots $Config
+    $maxBytes = [int64]$Config.WriteMaxMB * 1MB
+    $saved = New-Object System.Collections.ArrayList
+    $errors = New-Object System.Collections.ArrayList
+    $logPath = $null
+    foreach ($job in $jobs) {
+        try {
+            $src = $null
+            if ($job.Source) {
+                $src = Resolve-WssSaveSource $job.Source $roots
+                # Protected types (password vaults, certificates, ...) must not leave the PC under another name either.
+                $builtin = @($script:BuiltinDenyPatterns | ForEach-Object { New-WssPolicyRule -Pattern $_ -Source 'built-in' })
+                if (Test-WssBlocked ('\\local\source\' + [IO.Path]::GetFileName($src)) @{ Rules = $builtin }) {
+                    throw 'this file type is protected and cannot be uploaded.'
+                }
+            }
+            $name = $job.Name
+            if (-not $name) { if ($Arguments.name) { $name = "$($Arguments.name)" } else { $name = [IO.Path]::GetFileName($src) } }
+            Test-WssFileName $name
+            $targetUnc = $destUnc.TrimEnd('\') + '\' + $name
+            Assert-WssWritable $targetUnc $policy $writeRules
+            $encoding = 'utf8'; if ($Arguments.encoding) { $encoding = "$($Arguments.encoding)".ToLowerInvariant() }
+            $r = Save-WssOneFile -TargetDir $destUnc -Name $name -SourceFile $src -Content $job.Content -Encoding $encoding -Overwrite $overwrite -MaxBytes $maxBytes
+            # The final name (numbered copy) must be allowed as well.
+            Assert-WssWritable $r.target $policy $writeRules
+            $entry = [ordered]@{ source = $job.Label }
+            foreach ($k in $r.Keys) { $entry[$k] = $r[$k] }
+            $drivePath = Convert-WssUncToDrivePath $r.target $Targets
+            if ($drivePath) { $entry.drive_path = $drivePath }
+            [void]$saved.Add($entry)
+            try {
+                $logPath = Write-WssWriteLog $Config ([ordered]@{
+                        time = (Get-Date).ToUniversalTime().ToString('o'); user = "$env:USERDOMAIN\$env:USERNAME"; computer = $env:COMPUTERNAME
+                        source = $job.Label; target = $r.target; size = $r.size; overwritten = $r.overwritten; backup = $r.backup
+                    })
+            } catch {
+                $notes += "Write log could not be updated: $($_.Exception.Message)"
+            }
+        } catch {
+            [void]$errors.Add([ordered]@{ source = $job.Label; error = $_.Exception.Message })
+        }
+    }
+    if ($saved.Count -eq 0) {
+        throw ('No file was saved: ' + (($errors | ForEach-Object { "$($_.source): $($_.error)" }) -join ' | '))
+    }
+    $out = [ordered]@{ destination = $destUnc }
+    $dp = Convert-WssUncToDrivePath $destUnc $Targets
+    if ($dp) { $out.destination_drive_path = $dp }
+    $out.saved = @($saved)
+    if ($errors.Count -gt 0) { $out.errors = @($errors) }
+    if ($notes.Count -gt 0) { $out.notes = @($notes) }
+    if ($logPath) { $out.log = $logPath }
+    return $out
+}
+
+# ---------------------------------------------------------------------------
 # MCP protocol
 # ---------------------------------------------------------------------------
 
 function Get-WssToolDefinitions {
+    param([bool]$IncludeWrite = $false, [bool]$AllowOverwrite = $false)
     $serverProp = @{ type = 'string'; description = 'Restrict to one server (name as returned by list_servers). Default: all servers.' }
     return @(
         [ordered]@{
@@ -1571,7 +1859,28 @@ function Get-WssToolDefinitions {
             }
             annotations = @{ readOnlyHint = $false; destructiveHint = $false; idempotentHint = $false; openWorldHint = $false }
         }
-    )
+    ) + $(if ($IncludeWrite) { @(
+        [ordered]@{
+            name        = 'save_file'
+            title       = 'Save file to Windows server'
+            description = 'Writes files to a folder on a known Windows server share (UNC or mapped drive path; missing sub-folders are created). Sources: inline text "content" (+ "name"), or files from your Cowork workspace via source_marker (the marker file in your workspace folder, see copy_file) + source_name/source_names. Existing files are kept and a numbered copy is created unless overwrite=true' + $(if ($AllowOverwrite) { ' (the previous version is then kept as <name>.claude-backup-<timestamp>).' } else { '; overwriting is disabled by configuration.' }) + ' Blocked paths, policy files and executable/script types cannot be written. Every write is logged. Only save when the user asked for it.'
+            inputSchema = [ordered]@{
+                type       = 'object'
+                properties = [ordered]@{
+                    destination   = @{ type = 'string'; description = 'Target folder on the server: Z:\Reports\2024 or \\server\share\Reports.' }
+                    name          = @{ type = 'string'; description = 'File name (required with content; optional rename for a single source file).' }
+                    content       = @{ type = 'string'; description = 'Text to write (e.g. Markdown, CSV, JSON, TXT).' }
+                    encoding      = @{ type = 'string'; enum = @('utf8', 'utf8-bom', 'utf16'); default = 'utf8'; description = 'Encoding for content (utf8-bom helps Excel open CSV files).' }
+                    source_marker = @{ type = 'string'; description = 'Marker file name in your Cowork workspace folder (identifies the folder that source_name(s) are relative to).' }
+                    source_name   = @{ type = 'string'; description = 'File in the workspace folder to upload, relative to the marker''s folder (e.g. report.docx or out/chart.png).' }
+                    source_names  = @{ type = 'array'; items = @{ type = 'string' }; maxItems = 20; description = 'Several workspace files to upload.' }
+                    source_path   = @{ type = 'string'; description = 'Absolute local Windows path of a file inside the workspace or download folder.' }
+                    overwrite     = @{ type = 'boolean'; default = $false; description = 'Replace an existing file with the same name (keeps a backup of the old version).' }
+                }
+                required   = @('destination')
+            }
+            annotations = @{ readOnlyHint = $false; destructiveHint = $AllowOverwrite; idempotentHint = $false; openWorldHint = $false }
+        }) } else { @() })
 }
 
 function ConvertTo-WssHashtable {
@@ -1605,6 +1914,7 @@ function Invoke-WssTool {
         'read_file' { return Read-WssFile -Arguments $Arguments }
         'list_directory' { return Get-WssDirectoryListing -Arguments $Arguments }
         'copy_file' { return Copy-WssFiles -Arguments $Arguments }
+        'save_file' { return Save-WssFiles -Arguments $Arguments }
         default { throw [System.Collections.Generic.KeyNotFoundException]::new("Unknown tool: $Name") }
     }
 }
@@ -1647,10 +1957,14 @@ function Invoke-WssRequest {
                 })
         }
         'ping' { return New-WssResponse $id @{} }
-        'tools/list' { return New-WssResponse $id ([ordered]@{ tools = @(Get-WssToolDefinitions) }) }
+        'tools/list' {
+            $cfg = Get-WssConfig
+            $ws = Get-WssWriteStatus $cfg
+            return New-WssResponse $id ([ordered]@{ tools = @(Get-WssToolDefinitions -IncludeWrite $ws.enabled -AllowOverwrite $ws.allow_overwrite) })
+        }
         'tools/call' {
             $name = $params.name
-            $known = @(Get-WssToolDefinitions | ForEach-Object { $_.name })
+            $known = @(Get-WssToolDefinitions -IncludeWrite $true | ForEach-Object { $_.name })
             if ($known -notcontains $name) { return New-WssError $id -32602 "Unknown tool: $name" }
             $toolArgs = $params.arguments
             if ($null -eq $toolArgs) { $toolArgs = @{} }

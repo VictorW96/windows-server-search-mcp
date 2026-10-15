@@ -1,8 +1,21 @@
 {
-  "servers": ["\\\\fs01\\projects", "\\\\fs02"],
+  "servers": [
+    "\\\\fs01\\projects",
+    "\\\\fs02"
+  ],
   "autoDiscover": true,
-  "exclude": ["\\\\fs01\\scratch"],
-  "deny": ["**\\Personal", "\\\\fs01\\projects\\*\\Contracts"],
+  "exclude": [
+    "\\\\fs01\\scratch"
+  ],
+  "deny": [
+    "**\\Personal",
+    "\\\\fs01\\projects\\*\\Contracts"
+  ],
   "maxResults": 50,
-  "downloadDir": "C:\\Users\\me\\Documents\\Claude"
+  "downloadDir": "C:\\Users\\me\\Documents\\Claude",
+  "write": {
+    "enabled": false,
+    "allowOverwrite": false,
+    "maxMB": 100
+  }
 }

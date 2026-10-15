@@ -17,7 +17,9 @@
         "WSS_EXCLUDE": "${user_config.exclude}",
         "WSS_MAX_RESULTS": "${user_config.max_results}",
         "WSS_DOWNLOAD_DIR": "${user_config.download_dir}",
-        "WSS_DENY": "${user_config.deny_paths}"
+        "WSS_DENY": "${user_config.deny_paths}",
+        "WSS_WRITE_ENABLED": "${user_config.allow_write}",
+        "WSS_WRITE_OVERWRITE": "${user_config.allow_overwrite}"
       }
     }
   }

@@ -1,7 +1,7 @@
 {
   "name": "windows-server-search",
   "version": "__VERSION__",
-  "description": "Search and read files on Windows file servers through their Windows Search index, and copy them into your workspace. Automatically uses the network drives already mapped on this PC (e.g. Z: -> \\\\fileserver\\share); no setup needed. Windows only.",
+  "description": "Search, read, copy and (optionally) save files on Windows file servers through their Windows Search index. Automatically uses the network drives already mapped on this PC (e.g. Z: -> \\\\fileserver\\share); no setup needed. Windows only.",
   "author": {
     "name": "Victor Wolf",
     "url": "https://github.com/VictorW96"
@@ -61,6 +61,20 @@
       "title": "Download folder",
       "description": "Optional. Local folder that copy_file uses when no destination is given (e.g. your Cowork workspace folder). Default: Downloads\\Windows Server Search.",
       "default": "",
+      "required": false
+    },
+    "allow_write": {
+      "type": "boolean",
+      "title": "Allow writing to servers",
+      "description": "Enable the save_file tool so Claude can save files to the shares (never to blocked paths). Off by default. In Cowork, enable it in %APPDATA%\\windows-server-search-mcp\\config.json instead (\"write\": {\"enabled\": true}).",
+      "default": false,
+      "required": false
+    },
+    "allow_overwrite": {
+      "type": "boolean",
+      "title": "Allow overwriting files",
+      "description": "Let save_file replace existing files when asked; the previous version is kept as <name>.claude-backup-<timestamp>. Off by default.",
+      "default": false,
       "required": false
     }
   }

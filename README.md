@@ -39,6 +39,45 @@ so the server sees your mapped drives and Windows credentials.
 
 `read_file`, `list_directory` and `copy_file` only accept source paths inside the discovered or configured shares.
 
+| `save_file` | **Only when enabled:** saves text (`content`) or workspace files to a server folder. No delete, move or rename |
+
+### Writing to servers (`save_file`, off by default)
+
+Writing is **disabled unless you turn it on**. When enabled, Claude can save files to every known share
+except blocked paths:
+
+```json
+// %APPDATA%\windows-server-search-mcp\config.json  (Cowork)  – or plugin options allow_write / allow_overwrite (Claude Code)
+{ "write": { "enabled": true, "allowOverwrite": true, "maxMB": 100, "logPath": "\\\\fs01\\it\\claude-writes.jsonl" } }
+```
+
+- **Group Policy veto:** `DisableWrite = 1` (DWORD) under `HKLM\SOFTWARE\Policies\WindowsServerSearchMcp`
+  (or HKCU) turns writing off whatever the user configured. The tool then disappears.
+- **Disabled means hidden:** the tool isn't listed at all while writing is disabled. Turning it on takes
+  effect in the next session.
+- **Never writable:**
+  - blocked paths from the access policy;
+  - `.claude-policy` files;
+  - programs and scripts (`.exe .dll .com .scr .msi .bat .cmd .ps1 .vbs .js .hta .lnk .url .reg .jar` …),
+    plus `desktop.ini` and `autorun.inf`;
+  - names reserved by Windows.
+- **Sources:**
+  - inline text (`content` + `name`, encoding `utf8`, `utf8-bom` or `utf16`);
+  - files from the Cowork workspace (`source_marker` + `source_name(s)`), the configured download folder,
+    or the default download folder.
+  
+  Other local files can't be uploaded, so a manipulated prompt can't send arbitrary PC files to a server.
+  Password vaults and certificates (`*.kdbx`, `*.pfx`, …) are refused even when renamed.
+- **No silent overwrites:**
+  - an existing file gets a numbered copy (`report (1).docx`);
+  - `overwrite: true` replaces it only when `allowOverwrite` is configured, and the previous version is kept
+    as `report.docx.claude-backup-<yyyyMMdd-HHmmss>` (the save's date and time).
+- **No half-written files:** content goes to a hidden temp file in the target folder and is then renamed.
+- **Audit log:** each write is a JSON line (time, user, computer, source, target, size, overwritten, backup)
+  in `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl`, or in `logPath`, which may be a central
+  share.
+- **NTFS permissions apply:** files are written with the user's own Windows permissions, just like Explorer.
+
 ### Copying files into the Cowork workspace
 
 The MCP server runs on Windows. Claude sees its Cowork workspace folder only at its path inside the VM,
@@ -142,6 +181,10 @@ All settings are optional. A PC with mapped network drives works without any con
 | Default maximum results | `maxResults` / `WSS_MAX_RESULTS` | `50` | 1–500 |
 | Download folder | `downloadDir` / `WSS_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads\Windows Server Search` | Default destination for `copy_file` |
 | – | `maxCopyMB` / `WSS_MAX_COPY_MB` | `500` | Maximum size per copied file |
+| Allow writing to servers | `write.enabled` / `WSS_WRITE_ENABLED` | `false` | Enables `save_file` |
+| Allow overwriting files | `write.allowOverwrite` / `WSS_WRITE_OVERWRITE` | `false` | `overwrite: true` replaces files (with backup) |
+| – | `write.maxMB` / `WSS_WRITE_MAX_MB` | `100` | Maximum size per written file |
+| – | `write.logPath` / `WSS_WRITE_LOG` | `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl` | Write audit log |
 | – | `queryTimeout` / `WSS_QUERY_TIMEOUT` | `30` | Seconds per index query |
 | – | `useNetBios` / `WSS_USE_NETBIOS` | `true` | Query FQDN hosts by their NetBIOS name, which Windows Search requires |
 | – | `WSS_CONFIG_FILE` | `%APPDATA%\windows-server-search-mcp\config.json` | JSON file with `servers`, `exclude`, `autoDiscover`, `maxResults`, … |
@@ -184,6 +227,10 @@ Most of us have no Windows file server at hand, so the tests run in three layers
    value. They verify that search hides blocked files and reports the exact hidden count, that listings hide
    blocked entries, and that read and copy are refused. They also try to get around the rules with a
    trailing-dot path, an 8.3 short name and a client-evaluated symlink.
+   The `save_file` checks write to the share and verify the files directly in the server folder. They cover
+   numbered copies, overwriting with a backup, and an upload from the workspace. They check that
+   executables, blocked folders, `.claude-policy`, foreign local sources and non-share targets are refused,
+   that every write is logged, that the tool is hidden by default, and that the Group Policy veto works.
 
 Run locally (any OS with PowerShell 7 or Docker):
 
