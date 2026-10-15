@@ -99,7 +99,8 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
                 (Call 26 'save_file' @{ destination = "$($Env.Drive)\"; name = '.claude-policy'; content = '' }),
                 (Call 27 'save_file' @{ destination = "$($Env.Drive)\$UploadRel"; source_path = 'C:\Windows\win.ini' }),
                 (Call 28 'save_file' @{ destination = 'C:\Temp'; name = 'x.txt'; content = 'x' }),
-                '{"jsonrpc":"2.0","id":29,"method":"tools/list"}'
+                '{"jsonrpc":"2.0","id":29,"method":"tools/list"}',
+                (Call 30 'copy_file' @{ path = "$($Env.Drive)\alpha.txt"; destination = (Join-Path $env:APPDATA 'wss-should-not-exist') })
             ) @{ WSS_CONFIG_FILE = $CfgFile })
     }
 
@@ -222,6 +223,12 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         $m.result.content[0].text | Should -Match 'group-policy'
     }
 
+    It 'never copies into configuration folders such as AppData' {
+        $m = $Msgs | Where-Object id -eq 30
+        $m.result.isError | Should -BeTrue
+        $m.result.content[0].text | Should -Match 'configuration folder'
+        Test-Path -LiteralPath (Join-Path $env:APPDATA 'wss-should-not-exist') | Should -BeFalse
+    }
     It 'hides blocked entries in listings and refuses to list blocked folders' {
         $r = Get-ToolJson ($Msgs | Where-Object id -eq 7)
         $names = @($r.entries | ForEach-Object { $_.name })

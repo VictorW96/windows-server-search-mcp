@@ -625,7 +625,7 @@ function Select-WssTargets {
     $plans = @()
     $pathUnc = $null
     if ($Path) {
-        $pathUnc = Resolve-WssPath $Path $Targets -AllowAnyShareOfKnownServer
+        $pathUnc = Resolve-WssPath $Path $Targets
     }
     foreach ($srv in $Targets) {
         if ($Server -and -not ($srv.Name -ieq $Server -or $srv.Machine -ieq $Server)) { continue }
@@ -661,7 +661,8 @@ function Search-Wss {
 
     $policy = Get-WssPolicy -Config $Config -Targets $Targets
     if ($Arguments.path) {
-        Assert-WssAllowed (Resolve-WssPath $Arguments.path $Targets -AllowAnyShareOfKnownServer) $policy
+        # Only known shares: their .claude-policy files are loaded and excluded shares stay excluded.
+        Assert-WssAllowed (Resolve-WssPath $Arguments.path $Targets) $policy
     }
 
     $plans = @(Select-WssTargets $Targets $Arguments.server $Arguments.path)
@@ -814,7 +815,7 @@ function Resolve-WssPath {
       Converts a drive path (Z:\x) or UNC path into a normalized UNC path and checks that it lies
       within a known share. Throws otherwise.
     #>
-    param([string]$Path, $Targets, [switch]$AllowAnyShareOfKnownServer)
+    param([string]$Path, $Targets)
     if (-not $Path) { throw 'path is required' }
     $p = $Path.Trim() -replace '/', '\'
     if ($p -match '^([A-Za-z]:)(\\.*)?$') {
@@ -840,7 +841,6 @@ function Resolve-WssPath {
 
     foreach ($srv in $Targets) {
         if (-not ($u.Host -ieq $srv.Name -or $u.Host -ieq $srv.Machine)) { continue }
-        if ($AllowAnyShareOfKnownServer) { return $norm }
         foreach ($sh in $srv.Shares) {
             $root = "\\$($u.Host)" + $sh.Unc.Substring(2 + $srv.Name.Length)
             if ($norm -ieq $root -or $norm.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return $norm }
@@ -1369,14 +1369,100 @@ function Resolve-WssLocalDestination {
     return [IO.Path]::GetFullPath($p)
 }
 
+function Test-WssPathUnder {
+    <# True if Path equals Root or lies below it (case-insensitive, both already full paths). #>
+    param([string]$Path, [string]$Root)
+    if (-not $Path -or -not $Root) { return $false }
+    $p = $Path.TrimEnd('\', '/')
+    $r = $Root.TrimEnd('\', '/')
+    if (-not $r) { return $false }
+    return ($p -ieq $r -or $p.StartsWith($r + '\', [StringComparison]::OrdinalIgnoreCase) -or $p.StartsWith($r + '/', [StringComparison]::OrdinalIgnoreCase))
+}
+
+function Get-WssRealPath {
+    <#
+      Full path with 8.3 short names, symbolic links and junctions resolved (Windows), so prefix checks
+      cannot be bypassed with C:\Users\RUNNER~1 or a junction. Resolves the deepest existing ancestor and
+      appends the rest. Returns the plain full path elsewhere or when resolution fails.
+    #>
+    param([string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-WssIsWindows)) { return $full }
+    $existing = $full
+    $tail = @()
+    while ($existing -and -not (Test-Path -LiteralPath $existing)) {
+        $tail = @([IO.Path]::GetFileName($existing)) + $tail
+        $existing = [IO.Path]::GetDirectoryName($existing)
+    }
+    if (-not $existing) { return $full }
+    $real = Get-WssFinalPath $existing
+    if (-not $real) { return $full }
+    foreach ($t in $tail) { $real = [IO.Path]::Combine($real, $t) }
+    return $real
+}
+
+function Test-WssBroadFolder {
+    <# True for folders too broad to serve as a workspace: the search roots, the user profile and its top-level known folders. #>
+    param([string]$Dir, [string[]]$Roots = @())
+    $profileDir = [Environment]::GetFolderPath('UserProfile')
+    $broad = @($profileDir) + @($Roots)
+    foreach ($r in @($profileDir) + @($Roots)) {
+        foreach ($n in @('Documents', 'Desktop', 'Downloads', 'Pictures', 'Music', 'Videos', 'OneDrive')) { if ($r) { $broad += [IO.Path]::Combine($r, $n) } }
+    }
+    foreach ($f in @('MyDocuments', 'Desktop', 'MyPictures', 'MyMusic', 'MyVideos')) { $broad += [Environment]::GetFolderPath($f) }
+    foreach ($b in $broad) {
+        if ($b -and $Dir.TrimEnd('\', '/') -ieq ([IO.Path]::GetFullPath($b)).TrimEnd('\', '/')) { return $true }
+    }
+    return $false
+}
+
+function Assert-WssSafeLocalDestination {
+    <#
+      Refuses local folders where a copied file could run code or change configuration: Windows and program
+      folders, AppData (Startup, Claude's own configuration, WindowsApps on PATH, ...), dot folders in the
+      user profile (.ssh, .claude, ...), PowerShell profile folders, the profile root and drive roots.
+      The temp folder is allowed. Checked on the real path (short names and links resolved).
+    #>
+    param([string]$Dir)
+    $real = Get-WssRealPath $Dir
+    $tempDir = Get-WssRealPath ([IO.Path]::GetTempPath())
+    if (Test-WssPathUnder $real $tempDir) { return }
+    $msg = "Destination '$Dir' is a system, program or configuration folder; copy_file only writes to ordinary folders such as the Cowork workspace or Downloads."
+    if ($real -match '^[A-Za-z]:\\?$' -or $real -eq '/') { throw $msg }
+    $profileDir = [Environment]::GetFolderPath('UserProfile')
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    $denied = @(
+        $env:APPDATA, $env:LOCALAPPDATA, $env:ProgramData, $env:SystemRoot, $env:windir,
+        $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432,
+        [Environment]::GetFolderPath('Startup'), [Environment]::GetFolderPath('CommonStartup')
+    )
+    if ($profileDir) { $denied += [IO.Path]::Combine($profileDir, 'AppData') }
+    if ($docs) { $denied += [IO.Path]::Combine($docs, 'WindowsPowerShell'); $denied += [IO.Path]::Combine($docs, 'PowerShell') }
+    foreach ($d in $denied) {
+        if (-not $d) { continue }
+        if ((Test-WssPathUnder $real $d) -or (Test-WssPathUnder $real (Get-WssRealPath $d))) { throw $msg }
+    }
+    if ($profileDir) {
+        $realProfile = Get-WssRealPath $profileDir
+        if ($real.TrimEnd('\', '/') -ieq $realProfile.TrimEnd('\', '/')) { throw $msg }
+        if (Test-WssPathUnder $real $realProfile) {
+            foreach ($seg in ($real.Substring($realProfile.TrimEnd('\', '/').Length) -split '[\\/]')) {
+                if ($seg.StartsWith('.')) { throw $msg }
+            }
+        }
+    }
+}
+
 function Find-WssMarkerDirectory {
     <#
       Locates the folder containing a marker file (created by Claude inside its Cowork
       workspace folder) by searching the user's profile and OneDrive folders.
     #>
     param([string]$Marker, [string[]]$Roots = $null, [int]$MaxDepth = 6, [int]$TimeoutSeconds = 20)
-    if ($Marker -notmatch '^[A-Za-z0-9._-]{8,128}$') {
-        throw "Invalid destination_marker '$Marker' (8-128 characters: letters, digits, '.', '_' or '-')."
+    # A fixed prefix, so that ordinary files (.gitconfig, desktop.ini, ...) cannot pose as a marker
+    # and turn the user profile or Documents into a "workspace" that save_file may upload from.
+    if ($Marker -notmatch '^\.wss-[A-Za-z0-9_-]{8,120}$') {
+        throw "Invalid marker '$Marker' (must start with '.wss-' followed by 8-120 letters, digits, '_' or '-', e.g. .wss-target-7f3k9q2m)."
     }
     if ($script:WorkspaceCache.ContainsKey($Marker)) { return $script:WorkspaceCache[$Marker] }
     if (-not $Roots) {
@@ -1395,7 +1481,12 @@ function Find-WssMarkerDirectory {
         $item = $queue.Dequeue()
         $dir = $item[0]; $depth = $item[1]
         if (-not $seen.Add($dir)) { continue }
-        if (Test-Path -LiteralPath ([IO.Path]::Combine($dir, $Marker)) -PathType Leaf) {
+        $markerFile = [IO.Path]::Combine($dir, $Marker)
+        if (Test-Path -LiteralPath $markerFile -PathType Leaf) {
+            if ((Get-Item -LiteralPath $markerFile -Force).Length -gt 1KB) { throw "'$markerFile' is not an empty marker file." }
+            if (Test-WssBroadFolder $dir $Roots) {
+                throw "The marker '$Marker' is in '$dir', which is too broad to use as a workspace (user profile, OneDrive or a top-level folder such as Documents). Use a dedicated sub-folder, or pass destination as a Windows path."
+            }
             $script:WorkspaceCache[$Marker] = $dir
             return $dir
         }
@@ -1465,7 +1556,11 @@ function Copy-WssFiles {
             throw "Destination '$dest' is the configuration folder of this plugin; choose another folder."
         }
     }
+    Assert-WssSafeLocalDestination $dest
     if (-not (Test-Path -LiteralPath $dest -PathType Container)) { [void](New-Item -ItemType Directory -Path $dest -Force) }
+    # Programs and scripts only go to the workspace (marker) or the download folder, never to an arbitrary folder.
+    $execRules = @()
+    if ($destSource -eq 'argument') { $execRules = @(Get-WssWriteRules) }
 
     $overwrite = ConvertTo-WssBool $Arguments.overwrite $false
     $policy = Get-WssPolicy -Config $Config -Targets $Targets
@@ -1476,6 +1571,10 @@ function Copy-WssFiles {
         try {
             $unc = Resolve-WssPath $src $Targets
             Assert-WssAllowed $unc $policy -CheckFinalPath
+            $c = Get-WssCanonicalUnc $unc
+            foreach ($rule in $execRules) {
+                if ($rule.Regex.IsMatch($c)) { throw "programs and scripts can only be copied into the workspace (destination_marker) or the download folder, not to '$dest'." }
+            }
             $r = Copy-WssOneFile -Source $unc -DestinationDir $dest -Overwrite $overwrite -MaxBytes $maxBytes
             $entry = [ordered]@{ source = $unc }
             $drivePath = Convert-WssUncToDrivePath $unc $Targets
@@ -1578,15 +1677,26 @@ function Resolve-WssSaveSource {
     param([string]$Path, [string[]]$Roots)
     $full = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($Path))
     if ($full.StartsWith('\\')) { throw "Source '$Path' must be a local file (use the Cowork workspace or the download folder)." }
-    $ok = $false
+    $real = Get-WssRealPath $full
+    $root = $null
     foreach ($r in $Roots) {
-        $root = $r.TrimEnd('\', '/')
-        if ($full.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { $ok = $true }
+        $rr = $r.TrimEnd('\', '/')
+        # The real path (links resolved) must stay inside the same root as well.
+        if ($full.StartsWith($rr + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and
+            (Test-WssPathUnder $real (Get-WssRealPath $rr))) { $root = $rr; break }
     }
-    if (-not $ok) {
+    if (-not $root) {
         throw "Source '$Path' is outside the folders save_file may read from (the Cowork workspace located via source_marker, or the download folder)."
     }
+    # No hidden or dot files/folders (.ssh, .git, .env, the marker itself, ...).
+    foreach ($seg in ($full.Substring($root.Length) -split '[\\/]')) {
+        if ($seg.StartsWith('.')) { throw "Source '$Path' is a hidden file or inside a hidden folder ('$seg') and cannot be uploaded." }
+    }
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Source file not found: $full" }
+    $attr = [IO.File]::GetAttributes($full)
+    if (($attr -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)) -ne 0) {
+        throw "Source '$Path' is a hidden or system file and cannot be uploaded."
+    }
     return $full
 }
 
@@ -1594,7 +1704,7 @@ function Save-WssOneFile {
     <#
       Writes one file into TargetDir: via a hidden temp file + rename (no partial files).
       Existing file: numbered copy unless Overwrite, in which case the old version is kept as
-      "<name>.claude-backup-<timestamp>" next to it.
+      "<name>.claude-backup-<timestamp>" next to it (both keep the original file's permissions).
     #>
     param(
         [string]$TargetDir, [string]$Name,
@@ -1628,11 +1738,12 @@ function Save-WssOneFile {
             if (Test-Path -LiteralPath $target -PathType Container) { throw "a folder named '$Name' already exists." }
             if ($Overwrite) {
                 $backup = Get-WssUniquePath $TargetDir ($Name + '.claude-backup-' + (Get-Date).ToString('yyyyMMdd-HHmmss'))
-                [IO.File]::Copy($target, $backup, $false)
-                [IO.File]::Delete($target)
-                try { [IO.File]::Move($tmp, $target) } catch {
-                    # restore the previous version if the rename fails
-                    try { [IO.File]::Copy($backup, $target, $true) } catch { }
+                # ReplaceFile: the new content takes over the replaced file's ACL, attributes and streams, and the
+                # previous version is renamed to the backup, so it keeps its own ACL. Copy + delete + move would give
+                # both files the folder's inherited permissions instead. Fails rather than drop the ACL.
+                try { [IO.File]::Replace($tmp, $target, $backup, $false) } catch {
+                    # restore the previous version if it was already renamed to the backup
+                    if (-not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $backup)) { try { [IO.File]::Move($backup, $target) } catch { } }
                     throw
                 }
             } else {
@@ -1848,19 +1959,20 @@ function Get-WssToolDefinitions {
         [ordered]@{
             name        = 'copy_file'
             title       = 'Copy files from Windows server to this PC'
-            description = 'Copies files from a known Windows server share to a local folder on this PC so they can be opened or processed with other tools (PDFs, images, large spreadsheets, any format). In Claude Cowork: first create an empty marker file with a unique name (e.g. .wss-target-7f3k9q2m) in your workspace folder, then pass that name as destination_marker; the server finds the matching Windows folder and copies the files next to the marker. Existing files are never overwritten unless overwrite=true (a numbered copy such as "report (1).pdf" is created instead). Never writes to the server.'
+            description = 'Copies files from a known Windows server share to a local folder on this PC so they can be opened or processed with other tools (PDFs, images, large spreadsheets, any format). In Claude Cowork: first create an empty marker file with a unique name (e.g. .wss-target-7f3k9q2m) in your workspace folder, then pass that name as destination_marker; the server finds the matching Windows folder and copies the files next to the marker. Existing files are never overwritten unless overwrite=true (a numbered copy such as "report (1).pdf" is created instead). Never writes to the server, nor to system, program or configuration folders (AppData, dot folders, ...); programs and scripts only go to the workspace or the download folder.'
             inputSchema = [ordered]@{
                 type       = 'object'
                 properties = [ordered]@{
                     path               = @{ type = 'string'; description = 'File to copy: UNC path (\\server\share\dir\file.pdf) or mapped drive path (Z:\dir\file.pdf).' }
                     paths              = @{ type = 'array'; items = @{ type = 'string' }; maxItems = 50; description = 'Several files to copy (alternative to path).' }
-                    destination_marker = @{ type = 'string'; description = 'Name of a marker file you created in the destination folder (8-128 chars of letters, digits, . _ -). Recommended in Cowork: the files are copied into the folder that contains this marker.' }
+                    destination_marker = @{ type = 'string'; description = 'Name of a marker file you created in the destination folder: .wss- followed by 8-120 random letters, digits, _ or - (e.g. .wss-target-7f3k9q2m). Recommended in Cowork: the files are copied into the folder that contains this marker.' }
                     destination        = @{ type = 'string'; description = 'Absolute local Windows folder, e.g. C:\Users\me\Documents\Claude. Default: the configured download folder, else %USERPROFILE%\Downloads\Windows Server Search.' }
                     subfolder          = @{ type = 'string'; description = 'Optional relative sub-folder inside the destination (created if missing).' }
                     overwrite          = @{ type = 'boolean'; default = $false; description = 'Replace existing files with the same name.' }
                 }
             }
-            annotations = @{ readOnlyHint = $false; destructiveHint = $false; idempotentHint = $false; openWorldHint = $false }
+            # destructive: overwrite=true replaces local files
+            annotations = @{ readOnlyHint = $false; destructiveHint = $true; idempotentHint = $false; openWorldHint = $false }
         }
     ) + $(if ($IncludeWrite) { @(
         [ordered]@{

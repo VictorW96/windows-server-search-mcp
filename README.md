@@ -69,11 +69,13 @@ To restrict this:
     or the default download folder.
   
   Other local files can't be uploaded, so a manipulated prompt can't send arbitrary PC files to a server.
-  Password vaults and certificates (`*.kdbx`, `*.pfx`, …) are refused even when renamed.
+  Hidden files and dot folders (`.ssh`, `.env`, …) are refused, and so are password vaults and certificates
+  (`*.kdbx`, `*.pfx`, …), even when renamed.
 - **No silent overwrites:**
   - an existing file gets a numbered copy (`report (1).docx`);
   - `overwrite: true` replaces it (unless `allowOverwrite` is `false`), and the previous version is kept
-    as `report.docx.claude-backup-<yyyyMMdd-HHmmss>` (the save's date and time).
+    as `report.docx.claude-backup-<yyyyMMdd-HHmmss>` (the save's date and time). The new version and the
+    backup both keep the original file's NTFS permissions.
 - **No half-written files:** content goes to a hidden temp file in the target folder and is then renamed.
 - **Audit log:** each write is a JSON line (time, user, computer, source, target, size, overwritten, backup)
   in `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl`, or in `logPath`, which may be a central
@@ -85,14 +87,21 @@ To restrict this:
 The MCP server runs on Windows. Claude sees its Cowork workspace folder only at its path inside the VM,
 not at the Windows path. `copy_file` bridges the two with a marker file:
 
-1. Claude creates an empty file with a random name, e.g. `.wss-target-7f3k9q2m`, in its workspace folder.
+1. Claude creates an empty file with a random name starting with `.wss-`, e.g. `.wss-target-7f3k9q2m`, in its
+   workspace folder.
 2. Claude calls `copy_file` with `destination_marker: ".wss-target-7f3k9q2m"`.
 3. The server searches the user profile and OneDrive folders for the marker. It skips `AppData`, hidden
    folders and links, and caches the result per session. The files are copied next to the marker.
+   A marker directly in the user profile, the OneDrive folder or a top-level folder such as `Documents` or
+   `Desktop` is refused, so the workspace must be a dedicated folder.
 
 Alternatively, pass `destination` as a Windows path, or set the **Download folder** plugin option.
 Copies never overwrite existing files unless `overwrite: true`; a numbered copy is created instead.
 Copies never go to UNC paths or network drives, and each file has a size limit (`WSS_MAX_COPY_MB`, default 500).
+They never go to system, program or configuration folders either: Windows, Program Files, ProgramData,
+`AppData` (except the temp folder), dot folders in the user profile (`.ssh`, `.claude`, …), the PowerShell
+profile folders, the user profile itself or a drive root. Programs and scripts (`.exe`, `.ps1`, `.bat`, …) are
+only copied into the workspace (marker) or the download folder, not to another `destination`.
 
 ## Access policy (blocked paths)
 
@@ -141,6 +150,10 @@ reg add HKLM\SOFTWARE\Policies\WindowsServerSearchMcp /v DenyPaths /t REG_MULTI_
   blocked files don't crowd out allowed ones. `hidden_by_policy` counts the blocked hits among those
   examined.
 - **`list_servers`** shows the active rules per source, the policy files it found, and any blocked shares.
+
+- **Known shares only:** the `path` filter of `search_files` must lie inside a discovered or configured share.
+  Other shares of the same server, whose `.claude-policy` the plugin doesn't load, and excluded shares can't
+  be searched.
 
 **Limits:** this is a guardrail for Claude, not a security boundary.
 

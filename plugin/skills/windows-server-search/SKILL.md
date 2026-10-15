@@ -27,8 +27,8 @@ The `windows-server-search` MCP server queries the **Windows Search index of the
    PDFs, images, legacy `.doc`/`.xls`, or anything you want to process with your own tools
    (e.g. analysing a large spreadsheet with code). In **Cowork**, the MCP server runs on Windows and
    does not know the Windows path of your workspace folder, so:
-   1. create an empty marker file with a random name, e.g. `.wss-target-7f3k9q2m`, in your workspace
-      folder (the folder connected to this session);
+   1. create an empty marker file whose name starts with `.wss-` followed by at least 8 random characters,
+      e.g. `.wss-target-7f3k9q2m`, in your workspace folder (the folder connected to this session);
    2. call `copy_file` with `path` (or `paths`) and `destination_marker: ".wss-target-7f3k9q2m"`;
    3. the files appear next to the marker (use `subfolder` to keep things tidy); delete the marker when done.
    Outside Cowork, pass `destination` as a Windows folder path instead. Existing files are never
@@ -41,6 +41,7 @@ The `windows-server-search` MCP server queries the **Windows Search index of the
      replaced); the old version is then kept as `<name>.claude-backup-<timestamp>`. Otherwise a numbered copy
      is created – mention the new name.
    - Blocked paths, `.claude-policy` files and programs/scripts (`.exe`, `.ps1`, …) can't be written.
+   - Hidden files and files in dot folders (`.env`, `.ssh\…`) can't be uploaded.
    - If the tool is missing, writing was disabled by the user (`"write": { "enabled": false }` in
      `%APPDATA%\windows-server-search-mcp\config.json`) or by IT (Group Policy). If replacing files is refused,
      `"allowOverwrite": false` is set there.
@@ -70,4 +71,5 @@ share or through Group Policy, or by the user in the plugin settings. Blocked it
   An administrator has to enable this on the server; the plugin cannot. `read_file` / `list_directory`
   still work without an index.
 - Results only contain files the current Windows user is allowed to read.
-- `copy_file` only writes to local folders on this PC, never to a server share or network drive.
+- `copy_file` only writes to ordinary local folders on this PC: never to a server share or network drive, and never to
+  system or configuration folders (`AppData`, `.ssh`, …). Programs and scripts only go to the workspace or download folder.

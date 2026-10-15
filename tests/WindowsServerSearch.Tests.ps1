@@ -299,6 +299,12 @@ Describe 'Search-Wss' {
         $sql.Count | Should -Be 1
         $sql[0].Sql | Should -Match "SCOPE='file://fs01/projects/a/b'"
     }
+    It 'refuses paths on shares that are not known (their policy files would not be loaded)' {
+        { Search-Wss -Arguments @{ query = 'plan'; path = '\\fs01\salaries' } -Config (New-TestConfig) } | Should -Throw '*outside*'
+        { Search-Wss -Arguments @{ query = 'plan'; path = '\\fs01\C$\Users' } -Config (New-TestConfig) } | Should -Throw '*outside*'
+        { Search-Wss -Arguments @{ query = 'plan'; path = '\\fs02\hr' } -Config (New-TestConfig -Exclude @('\\fs02\hr')) } | Should -Throw '*outside*'
+        @(Get-TestSql).Count | Should -Be 0
+    }
     It 'reports partial failures and keeps other results' {
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' }, @{ Drive = 'Y:'; Unc = '\\fs02\hr' }) -Rows @{ fs01 = @(@{ 'System.ItemUrl' = 'file://fs01/p/x.txt'; 'System.FileName' = 'x.txt' }) } -Errors @{ fs02 = 'boom 0x80040E37' }
         $r = Search-Wss -Arguments @{ query = 'x' } -Config (New-TestConfig)
@@ -448,9 +454,53 @@ Describe 'copy_file helpers' {
         Find-WssMarkerDirectory -Marker '.wss-target-abc12345' -Roots @(Join-Path $Base 'profile') | Should -Be $ws
     }
     It 'rejects bad or unknown markers' {
-        { Find-WssMarkerDirectory -Marker '../etc' -Roots @($Base) } | Should -Throw '*Invalid destination_marker*'
-        { Find-WssMarkerDirectory -Marker 'short' -Roots @($Base) } | Should -Throw '*Invalid destination_marker*'
+        { Find-WssMarkerDirectory -Marker '../etc' -Roots @($Base) } | Should -Throw '*Invalid marker*'
+        { Find-WssMarkerDirectory -Marker 'short' -Roots @($Base) } | Should -Throw '*Invalid marker*'
+        { Find-WssMarkerDirectory -Marker '.wss-short' -Roots @($Base) } | Should -Throw '*Invalid marker*'
         { Find-WssMarkerDirectory -Marker '.wss-target-nothere99' -Roots @($Base) } | Should -Throw '*Could not find*'
+    }
+    It 'does not accept ordinary files as markers: <marker>' -TestCases @(
+        @{ marker = '.gitconfig' }, @{ marker = 'desktop.ini' }, @{ marker = 'ntuser.ini' }, @{ marker = 'NTUSER.DAT' }
+    ) {
+        $p = Join-Path $Base 'profile2'
+        New-Item -ItemType Directory -Path $p -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $p $marker) -Value 'x'
+        { Find-WssMarkerDirectory -Marker $marker -Roots @($p) } | Should -Throw '*Invalid marker*'
+    }
+    It 'refuses markers in broad folders (profile root, Documents, ...)' {
+        $p = Join-Path $Base 'profile3'
+        New-Item -ItemType Directory -Path (Join-Path $p 'Documents') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $p '.wss-target-root1234') -Value ''
+        Set-Content -LiteralPath (Join-Path $p 'Documents/.wss-target-docs1234') -Value ''
+        { Find-WssMarkerDirectory -Marker '.wss-target-root1234' -Roots @($p) } | Should -Throw '*too broad*'
+        { Find-WssMarkerDirectory -Marker '.wss-target-docs1234' -Roots @($p) } | Should -Throw '*too broad*'
+    }
+    It 'refuses marker files with content' {
+        $ws = Join-Path $Base 'profile4/Documents/Claude'
+        New-Item -ItemType Directory -Path $ws -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $ws '.wss-target-full1234') -Value ('x' * 2000)
+        { Find-WssMarkerDirectory -Marker '.wss-target-full1234' -Roots @(Join-Path $Base 'profile4') } | Should -Throw '*not an empty marker*'
+    }
+    It 'refuses system, configuration and dot folders as copy destinations' {
+        $home_ = [Environment]::GetFolderPath('UserProfile')
+        { Assert-WssSafeLocalDestination $home_ } | Should -Throw '*configuration folder*'
+        { Assert-WssSafeLocalDestination (Join-Path $home_ '.ssh') } | Should -Throw '*configuration folder*'
+        { Assert-WssSafeLocalDestination (Join-Path $home_ '.claude/plugins/x') } | Should -Throw '*configuration folder*'
+        { Assert-WssSafeLocalDestination (Join-Path $home_ 'Documents/Claude/ws') } | Should -Not -Throw
+        { Assert-WssSafeLocalDestination (Join-Path $Base 'dst') } | Should -Not -Throw -Because 'the temp folder is allowed'
+        if ($IsWindows -or $PSVersionTable.PSVersion.Major -lt 6) {
+            { Assert-WssSafeLocalDestination ([Environment]::GetFolderPath('Startup')) } | Should -Throw '*configuration folder*'
+            { Assert-WssSafeLocalDestination (Join-Path $env:APPDATA 'Claude') } | Should -Throw '*configuration folder*'
+            { Assert-WssSafeLocalDestination (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps') } | Should -Throw '*configuration folder*'
+            { Assert-WssSafeLocalDestination (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell') } | Should -Throw '*configuration folder*'
+            { Assert-WssSafeLocalDestination $env:SystemRoot } | Should -Throw '*configuration folder*'
+            { Assert-WssSafeLocalDestination 'C:\' } | Should -Throw '*configuration folder*'
+        }
+    }
+    It 'copies programs and scripts only into the workspace or download folder' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        { Copy-WssFiles -Arguments @{ path = '\\fs01\p\run.ps1'; destination = (Join-Path $Base 'dst') } -Config (New-TestConfig) } | Should -Throw '*programs and scripts*'
+        { Copy-WssFiles -Arguments @{ path = '\\fs01\p\x\Setup.EXE'; destination = (Join-Path $Base 'dst') } -Config (New-TestConfig) } | Should -Throw '*programs and scripts*'
     }
     It 'validates local destinations' {
         { Resolve-WssLocalDestination '' @() } | Should -Throw
@@ -705,6 +755,24 @@ Describe 'save_file' {
         $r.backup | Should -Match 'summary\.md\.claude-backup-\d{8}-\d{6}$'
         [IO.File]::ReadAllText($r.backup) | Should -Be '# Grüße'
     }
+    It 'keeps the original file permissions on the new version and on the backup' -Skip:(-not ($IsWindows -or $PSVersionTable.PSVersion.Major -lt 6)) {
+        $d = Join-Path $WBase 'acl'
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        $f = Join-Path $d 'restricted.txt'
+        Set-Content -LiteralPath $f -Value 'original'
+        $acl = Get-Acl -LiteralPath $f
+        $acl.SetAccessRuleProtection($true, $false)   # no inherited permissions
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')))
+        Set-Acl -LiteralPath $f -AclObject $acl
+        $before = (Get-Acl -LiteralPath $f).GetSecurityDescriptorSddlForm('Access')
+
+        $r = Save-WssOneFile -TargetDir $d -Name 'restricted.txt' -Content 'new' -Overwrite $true
+        [IO.File]::ReadAllText($r.target) | Should -Be 'new'
+        (Get-Acl -LiteralPath $r.target).GetSecurityDescriptorSddlForm('Access') | Should -Be $before
+        (Get-Acl -LiteralPath $r.backup).GetSecurityDescriptorSddlForm('Access') | Should -Be $before
+        ([IO.File]::GetAttributes($r.target) -band [IO.FileAttributes]::Hidden) | Should -Be 0
+    }
     It 'copies source files and supports encodings and size limits' {
         $d = Join-Path $WBase 'out2'
         $r = Save-WssOneFile -TargetDir $d -Name 'copy.txt' -SourceFile (Join-Path $WBase 'src.txt')
@@ -740,6 +808,19 @@ Describe 'save_file' {
         { Resolve-WssSaveSource (Join-Path $WBase 'src.txt') $roots } | Should -Throw '*outside the folders*'
         { Resolve-WssSaveSource (Join-Path $WBase 'ws/../src.txt') $roots } | Should -Throw '*outside the folders*'
         { Resolve-WssSaveSource (Join-Path $WBase 'ws/missing.txt') $roots } | Should -Throw '*not found*'
+    }
+    It 'refuses hidden files and dot folders as sources' {
+        $ws = Join-Path $WBase 'ws2'
+        New-Item -ItemType Directory -Path (Join-Path $ws '.ssh') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $ws '.ssh/id_ed25519') -Value 'KEY'
+        Set-Content -LiteralPath (Join-Path $ws '.env') -Value 'SECRET=1'
+        Set-Content -LiteralPath (Join-Path $ws 'hidden.txt') -Value 'h'
+        [IO.File]::SetAttributes((Join-Path $ws 'hidden.txt'), [IO.FileAttributes]::Hidden)
+        { Resolve-WssSaveSource (Join-Path $ws '.ssh/id_ed25519') @($ws) } | Should -Throw '*hidden*'
+        { Resolve-WssSaveSource (Join-Path $ws '.env') @($ws) } | Should -Throw '*hidden*'
+        if ($IsWindows -or $PSVersionTable.PSVersion.Major -lt 6) {
+            { Resolve-WssSaveSource (Join-Path $ws 'hidden.txt') @($ws) } | Should -Throw '*hidden*'
+        }
     }
     It 'requires a destination and a source' {
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
@@ -780,6 +861,7 @@ Describe 'MCP protocol' {
         $r = Invoke-WssMessageLine '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | ConvertFrom-Json
         @($r.result.tools.name) | Should -Be @('list_servers', 'search_files', 'read_file', 'list_directory', 'copy_file', 'save_file')
         ($r.result.tools | Where-Object name -eq 'copy_file').annotations.readOnlyHint | Should -BeFalse
+        ($r.result.tools | Where-Object name -eq 'copy_file').annotations.destructiveHint | Should -BeTrue
         foreach ($t in $r.result.tools) { $t.inputSchema.type | Should -Be 'object' }
         @(($r.result.tools | Where-Object name -eq 'read_file').inputSchema.required) | Should -Be @('path')
     }
