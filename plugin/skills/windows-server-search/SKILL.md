@@ -37,6 +37,17 @@ The `windows-server-search` MCP server queries the **Windows Search index of the
 Always show the user the **drive path** (e.g. `Z:\Projects\Plan.docx`) when available, otherwise the UNC path,
 so they can open the file themselves.
 
+## Access policy
+
+Some folders or files may be blocked by an access policy, set by IT in a `.claude-policy` file on the
+share or through Group Policy, or by the user in the plugin settings. Blocked items never appear in results.
+
+- When `search_files` or `list_directory` returns `hidden_by_policy` > 0, **tell the user how many results
+  were hidden by the access policy**, e.g. "3 matching files were hidden by your organisation's access policy".
+- When a tool says a path is *blocked by the access policy*, accept it. Don't try other paths, drive letters,
+  short names or links to reach the same content, and don't ask the user to paste it unless they offer.
+- `list_servers` shows the active rules (`access_policy`) when the user asks why something is not found.
+
 ## Troubleshooting
 
 - *No servers found*: no network drive is mapped. Ask the user to map one (`net use Z: \\server\share`)

@@ -70,9 +70,9 @@ function ConvertTo-WssInt {
 }
 
 function Split-WssList {
-    param([string]$Value)
+    param([string]$Value, [string]$Separators = '[;,\r\n]+')
     if (-not $Value) { return @() }
-    return @($Value -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    return @($Value -split $Separators | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
 function Get-WssConfig {
@@ -85,6 +85,8 @@ function Get-WssConfig {
         WSS_MAX_RESULTS      default result limit (default 50, max 500)
         WSS_QUERY_TIMEOUT    seconds per index query (default 30)
         WSS_USE_NETBIOS      true|false (default true) - query FQDN hosts by short name
+        WSS_DENY             ; or newline separated deny patterns (wildcards), e.g. \\fs01\hr\**;**\Personal
+        WSS_POLICY_TTL       seconds to cache share .claude-policy files (default 300)
         WSS_DOWNLOAD_DIR     default local folder for copy_file
         WSS_MAX_COPY_MB      maximum size per copied file in MB (default 500)
         WSS_CONFIG_FILE      path to JSON config file (default %APPDATA%\windows-server-search-mcp\config.json)
@@ -123,6 +125,8 @@ function Get-WssConfig {
         MaxResults     = ConvertTo-WssInt (Pick 'WSS_MAX_RESULTS' 'maxResults') 50 1 500
         QueryTimeout   = ConvertTo-WssInt (Pick 'WSS_QUERY_TIMEOUT' 'queryTimeout') 30 1 600
         UseNetBios     = ConvertTo-WssBool (Pick 'WSS_USE_NETBIOS' 'useNetBios') $true
+        Deny           = @(Split-WssList (Pick 'WSS_DENY' 'deny') '[;\r\n]+')
+        PolicyTtl      = ConvertTo-WssInt (Pick 'WSS_POLICY_TTL' 'policyTtl') 300 0 86400
         DownloadDir    = (Pick 'WSS_DOWNLOAD_DIR' 'downloadDir')
         MaxCopyMB      = ConvertTo-WssInt (Pick 'WSS_MAX_COPY_MB' 'maxCopyMB') 500 1 102400
         ConfigFile     = $path
@@ -624,11 +628,23 @@ function Search-Wss {
         throw 'Provide a query or at least one filter (extensions, kind, author, modified_after, modified_before).'
     }
 
+    $policy = Get-WssPolicy -Config $Config -Targets $Targets
+    if ($Arguments.path) {
+        Assert-WssAllowed (Resolve-WssPath $Arguments.path $Targets -AllowAnyShareOfKnownServer) $policy
+    }
+
     $plans = @(Select-WssTargets $Targets $Arguments.server $Arguments.path)
     if ($plans.Count -eq 0) {
         $names = ($Targets | ForEach-Object { $_.Name }) -join ', '
         throw "No matching server for server='$($Arguments.server)' path='$($Arguments.path)'. Known servers: $names"
     }
+    # Skip scopes on shares that are blocked entirely (e.g. unreadable policy file).
+    foreach ($plan in $plans) {
+        $plan.Scopes = @($plan.Scopes | Where-Object { -not (Test-WssBlocked $_ $policy) })
+    }
+    $plans = @($plans | Where-Object { $_.Scopes.Count -gt 0 })
+    if ($plans.Count -eq 0) { throw 'All matching shares are blocked by the access policy.' }
+    $hidden = 0
 
     $results = New-Object System.Collections.ArrayList
     $errors = New-Object System.Collections.ArrayList
@@ -637,13 +653,28 @@ function Search-Wss {
         $srv = $plan.Server
         $queried += $srv.Name
         try {
-            $sql = New-WssSearchSql -Machine $srv.Machine -Scopes $plan.Scopes -Query $Arguments.query -Match $match `
-                -Extensions $exts -Kind $Arguments.kind -Author $Arguments.author `
-                -ModifiedAfter $Arguments.modified_after -ModifiedBefore $Arguments.modified_before `
-                -IncludeFolders (ConvertTo-WssBool $Arguments.include_folders $false) -Sort $sort -Top $limit
-            Write-WssLog "Query [$($srv.Machine)]: $sql"
-            $rows = @(Invoke-WssQuery -Machine $srv.Machine -Sql $sql -TimeoutSeconds $Config.QueryTimeout)
-            foreach ($r in $rows) { [void]$results.Add((ConvertTo-WssResult $r $srv.Name $Targets)) }
+            # Fetch more than requested so blocked items do not crowd out allowed ones; widen once if needed.
+            $fetch = [Math]::Min($limit * 3 + 20, 2000)
+            for ($round = 0; $round -lt 2; $round++) {
+                $sql = New-WssSearchSql -Machine $srv.Machine -Scopes $plan.Scopes -Query $Arguments.query -Match $match `
+                    -Extensions $exts -Kind $Arguments.kind -Author $Arguments.author `
+                    -ModifiedAfter $Arguments.modified_after -ModifiedBefore $Arguments.modified_before `
+                    -IncludeFolders (ConvertTo-WssBool $Arguments.include_folders $false) -Sort $sort -Top $fetch
+                Write-WssLog "Query [$($srv.Machine)]: $sql"
+                $rows = @(Invoke-WssQuery -Machine $srv.Machine -Sql $sql -TimeoutSeconds $Config.QueryTimeout)
+                $allowed = New-Object System.Collections.ArrayList
+                $hiddenHere = 0
+                foreach ($r in $rows) {
+                    $res = ConvertTo-WssResult $r $srv.Name $Targets
+                    if ($res.path -and (Test-WssBlocked $res.path $policy)) { $hiddenHere++; continue }
+                    [void]$allowed.Add($res)
+                }
+                if ($allowed.Count -ge $limit -or $rows.Count -lt $fetch -or $fetch -ge 5000) { break }
+                $fetch = [Math]::Min($fetch * 4, 5000)
+            }
+            $hidden += $hiddenHere
+            $i = 0
+            foreach ($res in $allowed) { if ($i -ge $limit) { break }; [void]$results.Add($res); $i++ }
         } catch {
             if ($_.Exception.Message -match '^Invalid ') { throw }
             [void]$errors.Add([ordered]@{ server = $srv.Name; error = (Get-WssErrorMessage $_ $srv.Machine) })
@@ -664,10 +695,14 @@ function Search-Wss {
     if ($sorted.Count -gt $limit) { $sorted = $sorted[0..($limit - 1)] }
 
     $out = [ordered]@{
-        servers_queried = @($queried)
-        result_count    = $sorted.Count
-        results         = @($sorted)
+        servers_queried  = @($queried)
+        result_count     = $sorted.Count
+        hidden_by_policy = $hidden
     }
+    if ($hidden -gt 0) {
+        $out.policy_note = "$hidden matching file(s) were hidden from Claude by the access policy. Tell the user; do not try to access them another way."
+    }
+    $out.results = @($sorted)
     if ($errors.Count -gt 0) { $out.errors = @($errors) }
     if ($errors.Count -eq $plans.Count -and $plans.Count -gt 0) {
         throw ('All index queries failed: ' + (($errors | ForEach-Object { "$($_.server): $($_.error)" }) -join ' | '))
@@ -702,12 +737,16 @@ function Test-WssServer {
 function Get-WssServerList {
     param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig))
     $targets = @(Get-WssTargets -Config $Config)
+    $policy = Get-WssPolicy -Config $Config -Targets $targets
     $check = ConvertTo-WssBool $Arguments.check $false
     $list = @()
     foreach ($srv in $targets) {
         $shares = @()
         foreach ($sh in $srv.Shares) {
-            $shares += [ordered]@{ name = $sh.Name; path = $sh.Unc; drives = @($sh.Drives) }
+            $entryShare = [ordered]@{ name = $sh.Name; path = $sh.Unc; drives = @($sh.Drives) }
+            $rule = Test-WssBlocked $sh.Unc $policy
+            if ($rule) { $entryShare.blocked_by_policy = "$($rule.Source): $($rule.Pattern)" }
+            $shares += $entryShare
         }
         $entry = [ordered]@{
             name           = $srv.Name
@@ -726,6 +765,7 @@ function Get-WssServerList {
             excluded         = @($Config.Exclude)
             max_results      = $Config.MaxResults
         }
+        access_policy = (Get-WssPolicySummary $policy)
     }
     if ($list.Count -eq 0) {
         $out.hint = 'No servers found. Map a network drive to a Windows file server (net use Z: \\server\share) or configure the "servers" option of the plugin with UNC paths like \\server\share.'
@@ -868,6 +908,7 @@ function Read-WssFile {
     param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig), $Targets = $null)
     if ($null -eq $Targets) { $Targets = @(Get-WssTargets -Config $Config) }
     $unc = Resolve-WssPath $Arguments.path $Targets
+    Assert-WssAllowed $unc (Get-WssPolicy -Config $Config -Targets $Targets) -CheckFinalPath
     if (-not (Test-Path -LiteralPath $unc -PathType Leaf)) { throw "File not found: $unc" }
     $item = Get-Item -LiteralPath $unc
     $maxBytes = 50MB
@@ -899,12 +940,16 @@ function Get-WssDirectoryListing {
     param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig), $Targets = $null)
     if ($null -eq $Targets) { $Targets = @(Get-WssTargets -Config $Config) }
     $unc = Resolve-WssPath $Arguments.path $Targets
+    $policy = Get-WssPolicy -Config $Config -Targets $Targets
+    Assert-WssAllowed $unc $policy -CheckFinalPath
     if (-not (Test-Path -LiteralPath $unc -PathType Container)) { throw "Directory not found: $unc" }
     $limit = ConvertTo-WssInt $Arguments.max_entries 200 1 2000
     $entries = @()
     $count = 0
+    $hidden = 0
     $truncated = $false
     foreach ($i in Get-ChildItem -LiteralPath $unc -Force -ErrorAction SilentlyContinue) {
+        if (Test-WssBlocked ($unc.TrimEnd('\') + '\' + $i.Name) $policy) { $hidden++; continue }
         if ($count -ge $limit) { $truncated = $true; break }
         $count++
         $e = [ordered]@{ name = $i.Name; type = $(if ($i.PSIsContainer) { 'directory' } else { 'file' }) }
@@ -917,6 +962,326 @@ function Get-WssDirectoryListing {
     if ($drivePath) { $out.drive_path = $drivePath }
     $out.entries = @($entries)
     $out.truncated = $truncated
+    $out.hidden_by_policy = $hidden
+    return $out
+}
+
+# ---------------------------------------------------------------------------
+# Access policy: wildcard deny rules (gitignore-style) from several sources
+# ---------------------------------------------------------------------------
+
+$script:PolicyFileName = '.claude-policy'
+$script:BuiltinDenyPatterns = @(
+    '**\$RECYCLE.BIN',
+    '**\System Volume Information',
+    '**\*.kdbx',
+    '**\*.kdb',
+    '**\*.pfx',
+    '**\*.p12',
+    '**\~$*'
+)
+$script:PolicyCache = @{}
+$script:RegistryPolicyProvider = $null   # scriptblock: -> array of patterns (tests / fake backend)
+$script:PolicyFileReader = $null         # scriptblock: param($ShareUnc) -> @{ Status='none'|'ok'|'error'; Content; Error }
+$script:FinalPathTypeLoaded = $false
+
+function Get-WssCanonicalUnc {
+    <#
+      Normalises a UNC path for policy matching: NetBIOS host name, lower case, '.'/'..' resolved,
+      trailing dots/spaces and alternate data streams removed, optionally 8.3 short names expanded.
+    #>
+    param([string]$Path, [switch]$ExpandShortNames)
+    $u = ConvertFrom-WssUncPath $Path
+    if (-not $u) { return $null }
+    $hostName = (Get-WssQueryMachine $u.Host $true)
+    $raw = @()
+    if ($u.Share) { $raw += $u.Share }
+    if ($u.Rest) { $raw += ($u.Rest -split '\\') }
+    $segments = New-Object System.Collections.ArrayList
+    foreach ($seg in $raw) {
+        $s = $seg
+        $colon = $s.IndexOf(':')
+        if ($colon -ge 0) { $s = $s.Substring(0, $colon) }
+        if ($s.Trim() -eq '.') { continue }
+        if ($s.Trim() -eq '..') { if ($segments.Count -gt 1) { $segments.RemoveAt($segments.Count - 1) }; continue }
+        $s = $s.TrimEnd('.', ' ')
+        if ($s -eq '') { continue }
+        if ($ExpandShortNames -and $segments.Count -ge 1 -and $s -match '~\d' -and (Test-WssIsWindows)) {
+            try {
+                $parent = "\\$($u.Host)\" + ($segments -join '\')
+                $found = @([IO.Directory]::GetFileSystemEntries($parent, $s))
+                if ($found.Count -eq 1) { $s = [IO.Path]::GetFileName($found[0]) }
+            } catch { }
+        }
+        [void]$segments.Add($s)
+    }
+    $out = "\\$hostName"
+    if ($segments.Count -gt 0) { $out += '\' + ($segments -join '\') }
+    return $out.ToLowerInvariant()
+}
+
+function ConvertTo-WssGlobRegex {
+    <# Converts a glob (separator '\') into a regex fragment: ** any depth, * and ? within one name. #>
+    param([string]$Glob)
+    $g = $Glob.ToLowerInvariant()
+    $sb = New-Object Text.StringBuilder
+    $i = 0
+    while ($i -lt $g.Length) {
+        $c = $g[$i]
+        if ($c -eq '*') {
+            if ($i + 1 -lt $g.Length -and $g[$i + 1] -eq '*') {
+                $atStart = ($i -eq 0 -or $g[$i - 1] -eq '\')
+                $i += 2
+                if ($atStart -and $i -lt $g.Length -and $g[$i] -eq '\') { [void]$sb.Append('(?:.*\\)?'); $i++; continue }
+                [void]$sb.Append('.*'); continue
+            }
+            [void]$sb.Append('[^\\]*'); $i++; continue
+        }
+        if ($c -eq '?') { [void]$sb.Append('[^\\]'); $i++; continue }
+        [void]$sb.Append([regex]::Escape([string]$c)); $i++
+    }
+    return $sb.ToString()
+}
+
+function New-WssPolicyRule {
+    <#
+      Builds a deny rule. Without -ShareRoot (global sources): \\server\share\..., drive paths (Z:\...)
+      or floating patterns (match at any depth on any share). With -ShareRoot (a share's .claude-policy):
+      gitignore semantics - patterns with a leading or middle '\' are anchored at the share root,
+      others match at any depth inside the share. A matching folder blocks everything below it.
+    #>
+    param([string]$Pattern, [string]$Source, [string]$ShareRoot, $Targets = @())
+    $p = $Pattern.Trim() -replace '/', '\'
+    if (-not $p) { throw 'empty pattern' }
+    if ($p -match '[<>|"\x00-\x1f]') { throw "invalid characters in pattern '$Pattern'" }
+    if ($ShareRoot) {
+        $anchored = $false
+        if ($p.StartsWith('\')) { $anchored = $true; $p = $p.TrimStart('\') }
+        $p = $p.TrimEnd('\')
+        if ($p.Contains('\')) { $anchored = $true }
+        if (-not $p) { throw "pattern '$Pattern' matches the whole share; remove the share instead" }
+        $body = [regex]::Escape($ShareRoot.ToLowerInvariant()) + '\\'
+        if ($anchored) { $body += (ConvertTo-WssGlobRegex $p) } else { $body += '(?:.*\\)?' + (ConvertTo-WssGlobRegex $p) }
+    } else {
+        if ($p -match '^([A-Za-z]:)(\\.*)?$') {
+            $drive = $Matches[1].ToUpperInvariant()
+            $rest = ''; if ($Matches.Count -gt 2 -and $Matches[2]) { $rest = $Matches[2] }
+            $unc = $null
+            foreach ($srv in $Targets) { foreach ($sh in $srv.Shares) { if ($sh.Drives -contains $drive) { $unc = $sh.Unc } } }
+            if (-not $unc) { throw "drive $drive in pattern '$Pattern' is not a mapped drive of a known server" }
+            $p = $unc + $rest
+        }
+        $p = $p.TrimEnd('\')
+        if ($p.StartsWith('\\')) {
+            $m = [regex]::Match($p, '^\\\\([^\\]+)(.*)$')
+            $hostPart = $m.Groups[1].Value
+            if ($hostPart -notmatch '[*?]') { $hostPart = Get-WssQueryMachine $hostPart $true }
+            $body = '\\\\' + (ConvertTo-WssGlobRegex $hostPart) + (ConvertTo-WssGlobRegex $m.Groups[2].Value)
+        } else {
+            $p = $p.TrimStart('\')
+            if (-not $p) { throw 'empty pattern' }
+            $body = '\\\\[^\\]+\\(?:.*\\)?' + (ConvertTo-WssGlobRegex $p)
+        }
+    }
+    $regex = '^' + $body + '(?:\\.*)?$'
+    return @{
+        Pattern = $Pattern.Trim()
+        Source  = $Source
+        Regex   = New-Object regex($regex, ([Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'))
+    }
+}
+
+function ConvertFrom-WssPolicyText {
+    <# Parses a gitignore-style .claude-policy file. Returns @{ Patterns; Warnings }. Throws on invalid content. #>
+    param([string]$Text)
+    $patterns = @()
+    $warnings = @()
+    $n = 0
+    foreach ($line in ($Text -split "`r?`n")) {
+        $n++
+        $l = $line.Trim()
+        if ($n -eq 1) { $l = $l.TrimStart([char]0xFEFF) }
+        if (-not $l -or $l.StartsWith('#')) { continue }
+        if ($l.StartsWith('!')) { $warnings += "line ${n}: negation ('!') is not supported and was ignored"; continue }
+        if ($l -match '[<>|"\x00-\x1f]') { throw "line ${n}: invalid characters in '$l'" }
+        $patterns += $l
+    }
+    return @{ Patterns = $patterns; Warnings = $warnings }
+}
+
+function Get-WssRegistryDenyPatterns {
+    <# Deny patterns pushed by IT via Group Policy / Intune (users cannot write these keys). #>
+    if ($script:RegistryPolicyProvider) { return @(& $script:RegistryPolicyProvider) }
+    if (-not (Test-WssIsWindows)) { return @() }
+    $out = @()
+    foreach ($key in @('HKLM:\SOFTWARE\Policies\WindowsServerSearchMcp', 'HKCU:\SOFTWARE\Policies\WindowsServerSearchMcp')) {
+        try {
+            $v = (Get-ItemProperty -LiteralPath $key -Name DenyPaths -ErrorAction Stop).DenyPaths
+            foreach ($x in @($v)) { $out += @(Split-WssList "$x" '[;\r\n]+') }
+        } catch { }
+    }
+    return $out
+}
+
+function Read-WssSharePolicy {
+    <# Reads <share>\.claude-policy (cached). Returns @{ Status='none'|'ok'|'error'; Content; Error }. #>
+    param([string]$ShareUnc, [int]$TtlSeconds = 300)
+    $key = $ShareUnc.ToLowerInvariant()
+    $cached = $script:PolicyCache[$key]
+    if ($cached -and ((Get-Date) - $cached.Time).TotalSeconds -lt $TtlSeconds) { return $cached.Value }
+    if ($script:PolicyFileReader) {
+        $value = & $script:PolicyFileReader $ShareUnc
+    } elseif (-not (Test-WssIsWindows)) {
+        $value = @{ Status = 'none' }
+    } else {
+        $file = $ShareUnc.TrimEnd('\') + '\' + $script:PolicyFileName
+        try {
+            if ([IO.File]::Exists($file)) {
+                $info = New-Object IO.FileInfo($file)
+                if ($info.Length -gt 1MB) { $value = @{ Status = 'error'; Error = 'policy file is larger than 1 MB' } }
+                else { $value = @{ Status = 'ok'; Content = [IO.File]::ReadAllText($file) } }
+            } elseif ([IO.Directory]::Exists($ShareUnc)) {
+                $value = @{ Status = 'none' }
+            } else {
+                $value = @{ Status = 'error'; Error = 'share not reachable, so its policy file could not be checked' }
+            }
+        } catch {
+            $value = @{ Status = 'error'; Error = $_.Exception.Message }
+        }
+    }
+    $script:PolicyCache[$key] = @{ Time = (Get-Date); Value = $value }
+    return $value
+}
+
+function Get-WssPolicy {
+    <# Combines all deny sources. Sources can only add rules; a broken share policy blocks that share (fail closed). #>
+    param([hashtable]$Config, $Targets)
+    $rules = New-Object System.Collections.ArrayList
+    $warnings = New-Object System.Collections.ArrayList
+    $blocked = New-Object System.Collections.ArrayList
+    $files = New-Object System.Collections.ArrayList
+    $counts = [ordered]@{ 'built-in' = 0; 'group-policy' = 0; 'plugin-config' = 0; 'share-policy' = 0 }
+
+    $global = @()
+    foreach ($p in $script:BuiltinDenyPatterns) { $global += , @($p, 'built-in') }
+    foreach ($p in @(Get-WssRegistryDenyPatterns)) { $global += , @($p, 'group-policy') }
+    foreach ($p in @($Config.Deny)) { if ($p) { $global += , @($p, 'plugin-config') } }
+    foreach ($g in $global) {
+        try {
+            [void]$rules.Add((New-WssPolicyRule -Pattern $g[0] -Source $g[1] -Targets $Targets))
+            $counts[$g[1]]++
+        } catch {
+            [void]$warnings.Add("$($g[1]) pattern '$($g[0])' ignored: $($_.Exception.Message)")
+        }
+    }
+
+    $seen = @{}
+    foreach ($srv in $Targets) {
+        foreach ($sh in $srv.Shares) {
+            $root = "\\$($srv.Name)\$($sh.Name)"
+            $canon = Get-WssCanonicalUnc $root
+            if ($seen.ContainsKey($canon)) { continue }
+            $seen[$canon] = $true
+            $state = Read-WssSharePolicy $root $Config.PolicyTtl
+            if ($state.Status -eq 'none') { continue }
+            $reason = $null
+            if ($state.Status -eq 'ok') {
+                try {
+                    $parsed = ConvertFrom-WssPolicyText $state.Content
+                    $shareRules = @()
+                    foreach ($p in $parsed.Patterns) { $shareRules += New-WssPolicyRule -Pattern $p -Source "share-policy $root" -ShareRoot $canon }
+                    foreach ($r in $shareRules) { [void]$rules.Add($r) }
+                    $counts['share-policy'] += $shareRules.Count
+                    foreach ($w in $parsed.Warnings) { [void]$warnings.Add("$root\$($script:PolicyFileName) $w") }
+                    [void]$files.Add([ordered]@{ share = $root; rules = $shareRules.Count })
+                } catch {
+                    $reason = "invalid $($script:PolicyFileName): $($_.Exception.Message)"
+                }
+            } else {
+                $reason = "$($script:PolicyFileName) could not be read: $($state.Error)"
+            }
+            if ($reason) {
+                [void]$blocked.Add([ordered]@{ share = $root; reason = $reason })
+                [void]$rules.Add(@{
+                        Pattern = $root; Source = 'share-policy-error'
+                        Regex   = New-Object regex(('^' + [regex]::Escape($canon) + '(?:\\.*)?$'), ([Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'))
+                    })
+            }
+        }
+    }
+    return @{ Rules = $rules; Warnings = $warnings; BlockedShares = $blocked; PolicyFiles = $files; Counts = $counts }
+}
+
+function Test-WssBlocked {
+    <# Returns the first matching deny rule for a UNC path, or $null. #>
+    param([string]$Path, $Policy, [switch]$ExpandShortNames)
+    $c = Get-WssCanonicalUnc $Path -ExpandShortNames:$ExpandShortNames
+    if (-not $c) { return $null }
+    foreach ($r in $Policy.Rules) { if ($r.Regex.IsMatch($c)) { return $r } }
+    return $null
+}
+
+function Get-WssFinalPath {
+    <# Path after following client-side symbolic links (GetFinalPathNameByHandle); $null if unavailable. #>
+    param([string]$Path)
+    if (-not (Test-WssIsWindows)) { return $null }
+    try {
+        if (-not $script:FinalPathTypeLoaded) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class WssNativePath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder buffer, uint length, uint flags);
+    public static string FinalPath(string path) {
+        using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (h.IsInvalid) return null;
+            StringBuilder sb = new StringBuilder(32768);
+            uint n = GetFinalPathNameByHandleW(h, sb, 32768, 0);
+            if (n == 0 || n >= 32768) return null;
+            return sb.ToString();
+        }
+    }
+}
+'@
+            $script:FinalPathTypeLoaded = $true
+        }
+        $f = [WssNativePath]::FinalPath($Path)
+        if (-not $f) { return $null }
+        if ($f.StartsWith('\\?\UNC\')) { return '\\' + $f.Substring(8) }
+        if ($f.StartsWith('\\?\')) { return $f.Substring(4) }
+        return $f
+    } catch {
+        return $null
+    }
+}
+
+function Assert-WssAllowed {
+    <# Throws if the path (or the real path behind client-side symlinks) is blocked by policy. #>
+    param([string]$Path, $Policy, [switch]$CheckFinalPath)
+    $rule = Test-WssBlocked $Path $Policy -ExpandShortNames
+    if (-not $rule -and $CheckFinalPath) {
+        $final = Get-WssFinalPath $Path
+        if ($final) {
+            if (-not $final.StartsWith('\\')) { throw "Access to '$Path' is blocked: it resolves to a local path ($final)." }
+            $rule = Test-WssBlocked $final $Policy -ExpandShortNames
+        }
+    }
+    if ($rule) { throw "Access to '$Path' is blocked by the access policy ($($rule.Source): $($rule.Pattern))." }
+}
+
+function Get-WssPolicySummary {
+    param($Policy)
+    $out = [ordered]@{
+        rule_counts    = $Policy.Counts
+        policy_files   = @($Policy.PolicyFiles)
+        blocked_shares = @($Policy.BlockedShares)
+    }
+    if ($Policy.Warnings.Count -gt 0) { $out.warnings = @($Policy.Warnings) }
     return $out
 }
 
@@ -1064,12 +1429,14 @@ function Copy-WssFiles {
     if (-not (Test-Path -LiteralPath $dest -PathType Container)) { [void](New-Item -ItemType Directory -Path $dest -Force) }
 
     $overwrite = ConvertTo-WssBool $Arguments.overwrite $false
+    $policy = Get-WssPolicy -Config $Config -Targets $Targets
     $maxBytes = [int64]$Config.MaxCopyMB * 1MB
     $copied = New-Object System.Collections.ArrayList
     $errors = New-Object System.Collections.ArrayList
     foreach ($src in $sources) {
         try {
             $unc = Resolve-WssPath $src $Targets
+            Assert-WssAllowed $unc $policy -CheckFinalPath
             $r = Copy-WssOneFile -Source $unc -DestinationDir $dest -Overwrite $overwrite -MaxBytes $maxBytes
             $entry = [ordered]@{ source = $unc }
             $drivePath = Convert-WssUncToDrivePath $unc $Targets
@@ -1113,7 +1480,7 @@ function Get-WssToolDefinitions {
         [ordered]@{
             name        = 'search_files'
             title       = 'Search Windows server index'
-            description = 'Searches the Windows Search index of the Windows file server(s) for files by content and/or file name, with optional filters. Results include UNC path, mapped drive path, size, dates, author and relevance rank. Query syntax: words are ANDed (prefix match), "exact phrase", -exclude, OR between terms.'
+            description = 'Searches the Windows Search index of the Windows file server(s) for files by content and/or file name, with optional filters. Results include UNC path, mapped drive path, size, dates, author and relevance rank. Files blocked by the access policy are never returned; hidden_by_policy reports how many were withheld. Query syntax: words are ANDed (prefix match), "exact phrase", -exclude, OR between terms.'
             inputSchema = [ordered]@{
                 type       = 'object'
                 properties = [ordered]@{
@@ -1251,7 +1618,7 @@ function Invoke-WssRequest {
                     protocolVersion = $version
                     capabilities    = [ordered]@{ tools = [ordered]@{ listChanged = $false } }
                     serverInfo      = [ordered]@{ name = $script:ServerName; title = 'Windows Server Search'; version = $script:ServerVersion }
-                    instructions    = 'Search files on Windows file servers through their Windows Search index. Call list_servers first to see available servers/shares, then search_files; use read_file to read results as text, or copy_file to copy files into your workspace (e.g. PDFs or images).'
+                    instructions    = 'Search files on Windows file servers through their Windows Search index. Call list_servers first to see available servers/shares, then search_files; use read_file to read results as text, or copy_file to copy files into your workspace (e.g. PDFs or images). Some paths may be blocked by an access policy: report hidden_by_policy counts to the user and never try to work around a block.'
                 })
         }
         'ping' { return New-WssResponse $id @{} }
@@ -1328,6 +1695,20 @@ function Enable-WssFakeBackend {
         param($HostName)
         if ($script:FakeData.shares) { foreach ($k in $script:FakeData.shares.Keys) { if ($k -ieq $HostName) { return @($script:FakeData.shares[$k]) } } }
         return @()
+    }
+    $script:RegistryPolicyProvider = { @($script:FakeData.registryDeny) | Where-Object { $_ } }
+    $script:PolicyFileReader = {
+        param($ShareUnc)
+        if ($script:FakeData.policies) {
+            foreach ($k in $script:FakeData.policies.Keys) {
+                if ($k -ieq $ShareUnc) {
+                    $v = $script:FakeData.policies[$k]
+                    if ($v -is [hashtable]) { return @{ Status = 'error'; Error = $v.error } }
+                    return @{ Status = 'ok'; Content = "$v" }
+                }
+            }
+        }
+        return @{ Status = 'none' }
     }
     $script:QueryExecutor = {
         param($Machine, $Sql, $Timeout)

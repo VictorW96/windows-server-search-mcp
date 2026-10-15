@@ -53,6 +53,63 @@ Alternatively, pass `destination` as a Windows path, or set the **Download folde
 Copies never overwrite existing files unless `overwrite: true`; a numbered copy is created instead.
 Copies never go to UNC paths or network drives, and each file has a size limit (`WSS_MAX_COPY_MB`, default 500).
 
+## Access policy (blocked paths)
+
+You can block folders and files with wildcard patterns. Claude can't **find, list, read or copy** what they
+match. Search reports how many matches were hidden (`hidden_by_policy`), so the user knows something was
+withheld. Rules come from four sources and are combined. A source can only *add* blocks, never remove
+blocks set elsewhere:
+
+| Source | Maintained by | Setup on client PCs |
+|---|---|---|
+| **`.claude-policy` file in the root of a share**, gitignore style ([example](examples/.claude-policy)) | File server admins; protect it with NTFS permissions | **None.** Picked up automatically and re-read every 5 minutes (`WSS_POLICY_TTL`) |
+| **Group Policy / Intune**: registry value `DenyPaths` (REG_MULTI_SZ or `;`-separated) under `HKLM\SOFTWARE\Policies\WindowsServerSearchMcp` (or HKCU\…\Policies) | IT, centrally; users cannot write these keys | **None.** Deployed centrally |
+| **Plugin option "Blocked paths"** (`WSS_DENY`) | The user | Optional |
+| **Built-in**: `$RECYCLE.BIN`, `System Volume Information`, `*.kdbx`, `*.kdb`, `*.pfx`, `*.p12`, `~$*` | – | None |
+
+**Pattern syntax** (case-insensitive; `/` and `\` are interchangeable):
+
+- `*` matches within one name, `?` matches one character, and `**` matches any number of folders.
+- A pattern that matches a folder blocks everything below it.
+- Global patterns (Group Policy and the plugin option) can be:
+  - server paths like `\\fs01\hr`, `\\*\hr\**` or `\\fs01\projects\*\Contracts`;
+  - drive paths like `Z:\Finance`;
+  - floating patterns like `**\Personal`, `*.kdbx` or `Personal`, which match at any depth on every share.
+- In a `.claude-policy` file, patterns follow gitignore rules relative to the share:
+  - `name` matches at any depth;
+  - `/name` and `a/b` are anchored to the share root.
+  
+  `!` negations are not supported.
+
+Example Group Policy deployment (or the same value through Intune / GPO preferences):
+
+```
+reg add HKLM\SOFTWARE\Policies\WindowsServerSearchMcp /v DenyPaths /t REG_MULTI_SZ /d "\\fs01\hr\0**\Personal\0**\*.kdbx" /f
+```
+
+**How it is enforced:**
+
+- **Path normalisation:** paths are normalised before matching. The server name is reduced to its short
+  name, which also covers the full domain name. `..` segments, trailing dots and spaces, and `:stream`
+  suffixes are handled. 8.3 short names like `CONFID~1` are expanded.
+- **Links:** for reads, copies and listings, symbolic links that Windows follows on the client are resolved,
+  and the real target is checked too.
+- **Fail closed:** if a share's `.claude-policy` exists but can't be read or parsed, that whole share is
+  blocked, and `list_servers` explains why.
+- **Search filtering:** search examines `3 × max_results + 20` index hits, and up to 5000 if needed, so
+  blocked files don't crowd out allowed ones. `hidden_by_policy` counts the blocked hits among those
+  examined.
+- **`list_servers`** shows the active rules per source, the policy files it found, and any blocked shares.
+
+**Limits:** this is a guardrail for Claude, not a security boundary.
+
+- The user can still open these files themselves. Use NTFS permissions for real protection; Windows Search
+  already only returns files the user may read.
+- Junctions on the server are resolved server-side, so the client can't see where they lead. Block the
+  junction's own path as well.
+- If a server is reachable under an alias, such as a DNS alias or an IP address, use `\\*\share` patterns
+  or floating patterns.
+
 ## Configuration
 
 Plugin options (Cowork: plugin settings; Claude Code: `claude plugin configure windows-server-search`).
@@ -63,6 +120,8 @@ All options are optional.
 | Additional servers / shares | `WSS_SERVERS` | – | `;`-separated UNC paths, e.g. `\\fs01\projects;\\fs02`. A bare server searches all its shares (via `net view`) |
 | Use mapped network drives | `WSS_AUTO_DISCOVER` | `true` | Auto-discover servers from mapped drives (CIM `Win32_LogicalDisk`, `HKCU\Network`, PSDrives) |
 | Exclude servers / shares | `WSS_EXCLUDE` | – | `;`-separated server names or UNC shares to ignore |
+| Blocked paths | `WSS_DENY` | – | `;`-separated wildcard patterns; see [Access policy](#access-policy-blocked-paths) |
+| – | `WSS_POLICY_TTL` | `300` | Seconds to cache share `.claude-policy` files |
 | Default maximum results | `WSS_MAX_RESULTS` | `50` | 1–500 |
 | Download folder | `WSS_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads\Windows Server Search` | Default destination for `copy_file` |
 | – | `WSS_MAX_COPY_MB` | `500` | Maximum size per copied file |
@@ -104,6 +163,10 @@ Most of us have no Windows file server at hand, so the tests run in three layers
    **remote-syntax** queries (`RUNNER.SystemIndex` + `file://RUNNER/wsstest`), `read_file`,
    `list_directory` and `copy_file`. The `copy_file` checks include a simulated Cowork workspace found via
    the marker file, a batch copy with per-file errors, and refusing to write to the network drive.
+   The access policy checks use a real `.claude-policy` file on the share and a real Group Policy registry
+   value. They verify that search hides blocked files and reports the exact hidden count, that listings hide
+   blocked entries, and that read and copy are refused. They also try to get around the rules with a
+   trailing-dot path, an 8.3 short name and a client-evaluated symlink.
 
 Run locally (any OS with PowerShell 7 or Docker):
 

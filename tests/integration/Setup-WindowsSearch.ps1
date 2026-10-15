@@ -40,6 +40,40 @@ Set-Content -LiteralPath (Join-Path $Folder 'alpha.txt') -Value "The quarterly r
 Set-Content -LiteralPath (Join-Path $Folder 'sub folder\beta notes.txt') -Value "Meeting notes: $Token second file" -Encoding UTF8
 Set-Content -LiteralPath (Join-Path $Folder "$Token-name-only.log") -Value 'nothing special here' -Encoding UTF8
 
+# Files that the access policy must hide (all contain the token)
+New-Item -ItemType Directory -Path (Join-Path $Folder 'secret') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $Folder 'Confidential Documents') -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $Folder 'secret\plan.txt') -Value "Secret plan $Token" -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Folder 'alpha.hidden.txt') -Value "Hidden by pattern $Token" -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Folder 'regblocked.txt') -Value "Blocked by group policy $Token" -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Folder 'Confidential Documents\doc.txt') -Value "Confidential $Token" -Encoding UTF8
+# Share policy file (gitignore style)
+Set-Content -LiteralPath (Join-Path $Folder '.claude-policy') -Encoding UTF8 -Value @(
+    '# Access policy for Claude',
+    'secret/',
+    '*.hidden.txt',
+    '/Confidential Documents'
+)
+# Group Policy equivalent (HKLM\SOFTWARE\Policies)
+$polKey = 'HKLM:\SOFTWARE\Policies\WindowsServerSearchMcp'
+New-Item -Path $polKey -Force | Out-Null
+New-ItemProperty -Path $polKey -Name DenyPaths -PropertyType MultiString -Value @('**\regblocked*') -Force | Out-Null
+# 8.3 short name of the confidential folder (only if short names are enabled on this volume)
+$shortName = ''
+try {
+    $sp = (New-Object -ComObject Scripting.FileSystemObject).GetFolder((Join-Path $Folder 'Confidential Documents')).ShortPath
+    $leaf = Split-Path $sp -Leaf
+    if ($leaf -ne 'Confidential Documents') { $shortName = $leaf }
+} catch { }
+Write-Host "  8.3 short name: '$shortName'"
+# Relative symlink into the blocked folder, evaluated on the client (needs remote-to-remote evaluation)
+$symlink = ''
+try {
+    cmd /c "fsutil behavior set SymlinkEvaluation R2R:1 2>&1" | Out-Host
+    cmd /c "mklink /D `"$(Join-Path $Folder 'link-to-secret')`" secret 2>&1" | Out-Host
+    if (Test-Path (Join-Path $Folder 'link-to-secret\plan.txt')) { $symlink = 'link-to-secret' }
+} catch { }
+
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -134,13 +168,14 @@ while ((Get-Date) -lt $deadline) {
         $rs.Close()
     } catch { Write-Host "  query failed: $($_.Exception.Message)" } finally { try { $conn.Close() } catch { } }
     Write-Host ("  indexed items with token: {0} (catalog total {1})" -f $found, $(try { [WssSetup.Indexer]::Count() } catch { '?' }))
-    if ($found -ge 2) { break }
+    if ($found -ge 6) { break }
     Start-Sleep -Seconds 10
 }
-if ($found -lt 2) { throw "Indexer did not index the test files within $TimeoutSeconds s" }
+if ($found -lt 6) { throw "Indexer did not index the test files within $TimeoutSeconds s" }
 
 @{
     Token = $Token; Folder = $Folder; Share = $ShareName; Unc = $unc
     Drive = "${DriveLetter}:"; Computer = $env:COMPUTERNAME
+    ShortName = $shortName; Symlink = $symlink
 } | ConvertTo-Json | Set-Content -LiteralPath $OutFile -Encoding UTF8
 Step "Done. Environment written to $OutFile"

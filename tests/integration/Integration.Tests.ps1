@@ -74,7 +74,14 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
                 (Call 9 'copy_file' @{ path = "$($Env.Drive)\alpha.txt"; destination_marker = $Marker }),
                 (Call 10 'copy_file' @{ paths = @("$($Env.Drive)\alpha.txt", "\\$($Env.Computer)\$($Env.Share)\sub folder\beta notes.txt", "$($Env.Drive)\missing.txt"); destination = $CopyDir; subfolder = 'batch' }),
                 (Call 11 'copy_file' @{ path = "$($Env.Drive)\alpha.txt"; destination = "$($Env.Drive)\sub folder" }),
-                (Call 12 'copy_file' @{ path = 'C:\Windows\win.ini'; destination = $CopyDir })
+                (Call 12 'copy_file' @{ path = 'C:\Windows\win.ini'; destination = $CopyDir }),
+                (Call 13 'search_files' @{ query = $Env.Token; path = "$($Env.Drive)\secret" }),
+                (Call 14 'read_file' @{ path = "$($Env.Drive)\secret\plan.txt" }),
+                (Call 15 'read_file' @{ path = "$($Env.Drive)\SECRET.\plan.txt" }),
+                (Call 16 'read_file' @{ path = "$($Env.Drive)\$(if ($Env.ShortName) { $Env.ShortName } else { 'Confidential Documents' })\doc.txt" }),
+                (Call 17 'read_file' @{ path = "$($Env.Drive)\$(if ($Env.Symlink) { $Env.Symlink } else { 'secret' })\plan.txt" }),
+                (Call 18 'copy_file' @{ path = "$($Env.Drive)\regblocked.txt"; destination = $CopyDir }),
+                (Call 19 'list_directory' @{ path = "$($Env.Drive)\secret" })
             ))
     }
 
@@ -153,6 +160,53 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
 
     It 'refuses to copy local files outside the server shares' {
         ($Msgs | Where-Object id -eq 12).result.isError | Should -BeTrue
+    }
+
+    It 'hides blocked files from search and reports how many were hidden' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 2)
+        $names = @($r.results | ForEach-Object { $_.name })
+        foreach ($n in 'plan.txt', 'alpha.hidden.txt', 'regblocked.txt', 'doc.txt') { $names | Should -Not -Contain $n }
+        $r.hidden_by_policy | Should -Be 4
+        $r.policy_note | Should -Match '^4 matching file'
+    }
+
+    It 'reports the active access policy in list_servers' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 1)
+        $r.access_policy.rule_counts.'group-policy' | Should -Be 1
+        $r.access_policy.rule_counts.'share-policy' | Should -Be 3
+        @($r.access_policy.policy_files | ForEach-Object { $_.share }) | Should -Contain "\\$($Env.Computer)\$($Env.Share)"
+        @($r.access_policy.blocked_shares).Count | Should -Be 0
+    }
+
+    It 'refuses to search inside a blocked folder' {
+        ($Msgs | Where-Object id -eq 13).result.content[0].text | Should -Match 'blocked by the access policy'
+    }
+
+    It 'refuses to read blocked files (direct, trailing dot, 8.3 short name, symlink)' {
+        foreach ($id in 14, 15, 16, 17) {
+            $m = $Msgs | Where-Object id -eq $id
+            $m.result.isError | Should -BeTrue -Because "request $id must be blocked"
+            $m.result.content[0].text | Should -Match 'blocked' -Because "request $id"
+        }
+    }
+
+    It 'exercised the 8.3 and symlink bypass paths on this runner' {
+        if (-not $Env.ShortName) { Set-ItResult -Skipped -Because '8.3 short names are disabled on this volume' }
+        if (-not $Env.Symlink) { Set-ItResult -Skipped -Because 'symlink could not be created' }
+    }
+
+    It 'refuses to copy files blocked by group policy' {
+        $m = $Msgs | Where-Object id -eq 18
+        $m.result.isError | Should -BeTrue
+        $m.result.content[0].text | Should -Match 'group-policy'
+    }
+
+    It 'hides blocked entries in listings and refuses to list blocked folders' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 7)
+        $names = @($r.entries | ForEach-Object { $_.name })
+        foreach ($n in 'secret', 'alpha.hidden.txt', 'regblocked.txt', 'Confidential Documents') { $names | Should -Not -Contain $n }
+        $r.hidden_by_policy | Should -Be 4
+        ($Msgs | Where-Object id -eq 19).result.isError | Should -BeTrue
     }
 
     It 'refuses to read local files outside the server shares' {

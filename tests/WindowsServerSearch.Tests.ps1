@@ -7,12 +7,20 @@ BeforeAll {
     $script:Mod = Get-Module WindowsServerSearch
 
     function Set-TestBackend {
-        param($Drives = @(), $Shares = @{}, $Rows = @{}, $Errors = @{})
+        param($Drives = @(), $Shares = @{}, $Rows = @{}, $Errors = @{}, $Registry = @(), $Policies = @{})
         & $script:Mod {
-            param($Drives, $Shares, $Rows, $Errors)
+            param($Drives, $Shares, $Rows, $Errors, $Registry, $Policies)
             $script:TestDrives = $Drives; $script:TestShares = $Shares; $script:TestRows = $Rows; $script:TestErrors = $Errors
+            $script:TestRegistry = $Registry; $script:TestPolicies = $Policies
             $script:TestSql = New-Object System.Collections.ArrayList
             $script:DriveProvider = { $script:TestDrives }
+            $script:PolicyCache = @{}
+            $script:RegistryPolicyProvider = { @($script:TestRegistry) }
+            $script:PolicyFileReader = {
+                param($u)
+                foreach ($k in $script:TestPolicies.Keys) { if ($k -ieq $u) { return $script:TestPolicies[$k] } }
+                @{ Status = 'none' }
+            }
             $script:ShareProvider = { param($h) foreach ($k in $script:TestShares.Keys) { if ($k -ieq $h) { return $script:TestShares[$k] } }; @() }
             $script:QueryExecutor = {
                 param($m, $sql, $t)
@@ -21,12 +29,12 @@ BeforeAll {
                 foreach ($k in $script:TestRows.Keys) { if ($k -ieq $m) { return $script:TestRows[$k] } }
                 @()
             }
-        } $Drives $Shares $Rows $Errors
+        } $Drives $Shares $Rows $Errors $Registry $Policies
     }
     function Get-TestSql { & $script:Mod { @($script:TestSql) } }
     function New-TestConfig {
-        param($Servers = @(), $AutoDiscover = $true, $Exclude = @(), $MaxResults = 50)
-        @{ Servers = @($Servers); AutoDiscover = $AutoDiscover; Exclude = @($Exclude); MaxResults = $MaxResults; QueryTimeout = 5; UseNetBios = $true }
+        param($Servers = @(), $AutoDiscover = $true, $Exclude = @(), $MaxResults = 50, $Deny = @())
+        @{ Servers = @($Servers); AutoDiscover = $AutoDiscover; Exclude = @($Exclude); MaxResults = $MaxResults; QueryTimeout = 5; UseNetBios = $true; Deny = @($Deny); PolicyTtl = 0; MaxCopyMB = 500 }
     }
 }
 
@@ -298,7 +306,7 @@ Describe 'Search-Wss' {
     It 'limits results' {
         $r = Search-Wss -Arguments @{ query = 'plan'; max_results = 1 } -Config (New-TestConfig)
         $r.result_count | Should -Be 1
-        (Get-TestSql)[0].Sql | Should -Match '^SELECT TOP 1 '
+        (Get-TestSql)[0].Sql | Should -Match '^SELECT TOP 23 ' -Because 'limit*3+20 rows are examined so blocked files do not crowd out allowed ones'
     }
 }
 
@@ -453,6 +461,161 @@ Describe 'copy_file helpers' {
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
         $cfg = New-TestConfig; $cfg.MaxCopyMB = 1
         { Copy-WssFiles -Arguments @{ path = '\\fs01\p\a.pdf'; destination = (Join-Path $Base 'dst'); subfolder = '../escape' } -Config $cfg } | Should -Throw '*Invalid subfolder*'
+    }
+}
+
+Describe 'Access policy: patterns' {
+    BeforeAll {
+        function Test-Pattern([string]$Pattern, [string]$Path, [string]$ShareRoot = $null) {
+            $t = @(@{ Name = 'fs01'; Machine = 'fs01'; Shares = @(@{ Name = 'data'; Unc = '\\fs01\data'; Drives = @('Z:') }) })
+            $rule = New-WssPolicyRule -Pattern $Pattern -Source 'test' -ShareRoot $ShareRoot -Targets $t
+            $rule.Regex.IsMatch((Get-WssCanonicalUnc $Path))
+        }
+    }
+    It '<pattern> vs <path> -> <expected>' -TestCases @(
+        @{ pattern = '\\fs01\hr\**'; path = '\\fs01\hr\a\b.txt'; expected = $true }
+        @{ pattern = '\\fs01\hr'; path = '\\FS01.corp.local\HR\x.docx'; expected = $true }
+        @{ pattern = '\\fs01\hr'; path = '\\fs01\hr'; expected = $true }
+        @{ pattern = '\\fs01\hr'; path = '\\fs01\hrx\a.txt'; expected = $false }
+        @{ pattern = '\\fs01\hr'; path = '\\fs02\hr\a.txt'; expected = $false }
+        @{ pattern = '\\*\hr'; path = '\\fs02\hr\a.txt'; expected = $true }
+        @{ pattern = '**\Personal\**'; path = '\\fs01\data\Team\Personal\x.txt'; expected = $true }
+        @{ pattern = '**\Personal'; path = '\\fs01\data\Personal'; expected = $true }
+        @{ pattern = 'Personal'; path = '\\fs01\Personal\x'; expected = $true }
+        @{ pattern = '**\Personal\**'; path = '\\fs01\data\Personalities\x.txt'; expected = $false }
+        @{ pattern = '**\*.kdbx'; path = '\\fs01\data\a\vault.KDBX'; expected = $true }
+        @{ pattern = '*.kdbx'; path = '\\fs01\data\a\vault.kdbx.txt'; expected = $false }
+        @{ pattern = '\\fs01\data\*\Contracts\**'; path = '\\fs01\data\ProjA\Contracts\c.pdf'; expected = $true }
+        @{ pattern = '\\fs01\data\*\Contracts\**'; path = '\\fs01\data\ProjA\Sub\Contracts\c.pdf'; expected = $false }
+        @{ pattern = '\\fs01\data\**\Contracts'; path = '\\fs01\data\ProjA\Sub\Contracts\c.pdf'; expected = $true }
+        @{ pattern = '\\fs01\data\Pay?oll*'; path = '\\fs01\data\Payroll 2024\x.xlsx'; expected = $true }
+        @{ pattern = 'Z:\Finance'; path = '\\fs01\data\finance\q1.xlsx'; expected = $true }
+        @{ pattern = '//fs01/data/finance/'; path = '\\fs01\data\Finance\q1.xlsx'; expected = $true }
+        @{ pattern = 'a+b (1).txt'; path = '\\fs01\data\x\a+b (1).txt'; expected = $true }
+        @{ pattern = 'a+b (1).txt'; path = '\\fs01\data\x\aab (1).txt'; expected = $false }
+    ) {
+        Test-Pattern $pattern $path | Should -Be $expected
+    }
+    It 'share policy (gitignore) semantics: <pattern> vs <path> -> <expected>' -TestCases @(
+        @{ pattern = 'secret'; path = '\\fs01\data\secret\x.txt'; expected = $true }
+        @{ pattern = 'secret'; path = '\\fs01\data\a\b\secret\x.txt'; expected = $true }
+        @{ pattern = 'secret/'; path = '\\fs01\data\a\secret\x.txt'; expected = $true }
+        @{ pattern = '/secret'; path = '\\fs01\data\a\secret\x.txt'; expected = $false }
+        @{ pattern = '/secret'; path = '\\fs01\data\secret\x.txt'; expected = $true }
+        @{ pattern = 'a/secret'; path = '\\fs01\data\a\secret'; expected = $true }
+        @{ pattern = 'a/secret'; path = '\\fs01\data\b\a\secret'; expected = $false }
+        @{ pattern = '*.hidden.txt'; path = '\\fs01\data\x\y.hidden.txt'; expected = $true }
+        @{ pattern = '**/drafts/**'; path = '\\fs01\data\p\drafts\d.docx'; expected = $true }
+        @{ pattern = 'secret'; path = '\\fs01\other\secret\x.txt'; expected = $false }
+        @{ pattern = 'secret'; path = '\\fs01.corp\DATA\Secret\x.txt'; expected = $true }
+    ) {
+        Test-Pattern $pattern $path '\\fs01\data' | Should -Be $expected
+    }
+    It 'rejects invalid patterns' {
+        { New-WssPolicyRule -Pattern 'a|b' -Source t } | Should -Throw
+        { New-WssPolicyRule -Pattern '   ' -Source t } | Should -Throw
+        { New-WssPolicyRule -Pattern '/' -Source t -ShareRoot '\\fs01\data' } | Should -Throw
+        { New-WssPolicyRule -Pattern 'Q:\x' -Source t -Targets @() } | Should -Throw '*not a mapped drive*'
+    }
+}
+
+Describe 'Access policy: canonical paths' {
+    It 'normalises <path>' -TestCases @(
+        @{ path = '\\FS01.corp.local\Data\A\B.txt'; expected = '\\fs01\data\a\b.txt' }
+        @{ path = '\\fs01\data\a\..\secret\x.txt'; expected = '\\fs01\data\secret\x.txt' }
+        @{ path = '\\fs01\data\secret.\x.txt. '; expected = '\\fs01\data\secret\x.txt' }
+        @{ path = '\\fs01\data\secret\x.txt:hidden:$DATA'; expected = '\\fs01\data\secret\x.txt' }
+        @{ path = '//fs01/data//secret/./x.txt'; expected = '\\fs01\data\secret\x.txt' }
+        @{ path = '\\fs01\data\..\..\x'; expected = '\\fs01\data\x' }
+    ) {
+        Get-WssCanonicalUnc $path | Should -Be $expected
+    }
+}
+
+Describe 'Access policy: sources and enforcement' {
+    It 'parses gitignore-style policy files' {
+        $r = ConvertFrom-WssPolicyText "# comment`r`n`r`nsecret/`n  *.tmp  `n!keep.txt`n/top"
+        $r.Patterns | Should -Be @('secret/', '*.tmp', '/top')
+        $r.Warnings.Count | Should -Be 1
+        { ConvertFrom-WssPolicyText "ok`nbad|line" } | Should -Throw '*line 2*'
+    }
+    It 'combines built-in, group policy, plugin and share policy rules' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }) -Registry @('**\HR') -Policies @{ '\\fs01\data' = @{ Status = 'ok'; Content = "secret`n" } }
+        $cfg = New-TestConfig -Deny @('**\Personal')
+        $t = @(Get-WssTargets -Config $cfg)
+        $p = Get-WssPolicy -Config $cfg -Targets $t
+        $p.Counts['group-policy'] | Should -Be 1
+        $p.Counts['plugin-config'] | Should -Be 1
+        $p.Counts['share-policy'] | Should -Be 1
+        $p.Counts['built-in'] | Should -BeGreaterThan 3
+        (Test-WssBlocked '\\fs01\data\x\HR\a.txt' $p).Source | Should -Be 'group-policy'
+        (Test-WssBlocked '\\fs01\data\Personal\a.txt' $p).Source | Should -Be 'plugin-config'
+        (Test-WssBlocked '\\fs01\data\secret\a.txt' $p).Source | Should -Be 'share-policy \\fs01\data'
+        (Test-WssBlocked '\\fs01\data\$RECYCLE.BIN\a.txt' $p).Source | Should -Be 'built-in'
+        Test-WssBlocked '\\fs01\data\public\a.txt' $p | Should -BeNullOrEmpty
+    }
+    It 'fails closed when a share policy file is unreadable or invalid' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }, @{ Drive = 'Y:'; Unc = '\\fs01\hr' }, @{ Drive = 'X:'; Unc = '\\fs01\ok' }) -Policies @{
+            '\\fs01\data' = @{ Status = 'error'; Error = 'access denied' }
+            '\\fs01\hr'   = @{ Status = 'ok'; Content = "bad<pattern" }
+        }
+        $cfg = New-TestConfig
+        $p = Get-WssPolicy -Config $cfg -Targets @(Get-WssTargets -Config $cfg)
+        @($p.BlockedShares).Count | Should -Be 2
+        Test-WssBlocked '\\fs01\data\a.txt' $p | Should -Not -BeNullOrEmpty
+        Test-WssBlocked '\\fs01\hr\a.txt' $p | Should -Not -BeNullOrEmpty
+        Test-WssBlocked '\\fs01\ok\a.txt' $p | Should -BeNullOrEmpty
+    }
+    It 'invalid global patterns are reported but do not block everything' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }) -Registry @('Q:\nope')
+        $cfg = New-TestConfig
+        $p = Get-WssPolicy -Config $cfg -Targets @(Get-WssTargets -Config $cfg)
+        @($p.Warnings).Count | Should -Be 1
+        Test-WssBlocked '\\fs01\data\a.txt' $p | Should -BeNullOrEmpty
+    }
+    It 'hides blocked search results and counts them' {
+        $rows = @()
+        foreach ($n in 'a.txt', 'secret\b.txt', 'c.txt', 'secret\d.txt', 'vault.kdbx') {
+            $rows += @{ 'System.ItemUrl' = 'file://fs01/data/' + ($n -replace '\\', '/'); 'System.FileName' = (Split-Path $n -Leaf); 'System.Search.Rank' = 100 }
+        }
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }) -Rows @{ fs01 = $rows } -Policies @{ '\\fs01\data' = @{ Status = 'ok'; Content = 'secret' } }
+        $r = Search-Wss -Arguments @{ query = 'x' } -Config (New-TestConfig)
+        $r.hidden_by_policy | Should -Be 3
+        $r.policy_note | Should -Match '^3 matching file'
+        @($r.results | ForEach-Object { $_.name }) | Should -Be @('a.txt', 'c.txt')
+    }
+    It 'widens the query when blocked results crowd out allowed ones' {
+        $rows = @()
+        for ($i = 0; $i -lt 23; $i++) { $rows += @{ 'System.ItemUrl' = "file://fs01/data/secret/$i.txt"; 'System.FileName' = "$i.txt" } }
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }) -Rows @{ fs01 = $rows } -Policies @{ '\\fs01\data' = @{ Status = 'ok'; Content = 'secret' } }
+        $r = Search-Wss -Arguments @{ query = 'x'; max_results = 1 } -Config (New-TestConfig)
+        @(Get-TestSql).Count | Should -Be 2
+        (Get-TestSql)[1].Sql | Should -Match '^SELECT TOP 92 '
+        $r.result_count | Should -Be 0
+    }
+    It 'refuses to search inside a blocked folder' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }) -Policies @{ '\\fs01\data' = @{ Status = 'ok'; Content = 'secret' } }
+        { Search-Wss -Arguments @{ query = 'x'; path = 'Z:\a\Secret\sub' } -Config (New-TestConfig) } | Should -Throw '*blocked by the access policy*'
+    }
+    It 'skips blocked shares entirely' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }, @{ Drive = 'Y:'; Unc = '\\fs02\hr' }) -Registry @('\\fs02\hr')
+        $null = Search-Wss -Arguments @{ query = 'x' } -Config (New-TestConfig)
+        @(Get-TestSql | ForEach-Object { $_.Machine }) | Should -Be @('fs01')
+    }
+    It 'refuses read_file, copy_file and list_directory on blocked paths' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }) -Policies @{ '\\fs01\data' = @{ Status = 'ok'; Content = 'secret' } }
+        $cfg = New-TestConfig
+        { Read-WssFile -Arguments @{ path = 'Z:\secret\a.txt' } -Config $cfg } | Should -Throw '*blocked by the access policy*'
+        { Read-WssFile -Arguments @{ path = 'Z:\x\..\SECRET.\a.txt' } -Config $cfg } | Should -Throw '*blocked by the access policy*'
+        { Get-WssDirectoryListing -Arguments @{ path = 'Z:\secret' } -Config $cfg } | Should -Throw '*blocked by the access policy*'
+        { Copy-WssFiles -Arguments @{ path = 'Z:\secret\a.pdf'; destination = [IO.Path]::GetTempPath() } -Config $cfg } | Should -Throw '*blocked by the access policy*'
+    }
+    It 'shows the policy in list_servers' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }, @{ Drive = 'Y:'; Unc = '\\fs01\hr' }) -Registry @('\\fs01\hr') -Policies @{ '\\fs01\data' = @{ Status = 'ok'; Content = "secret`n*.tmp" } }
+        $r = Get-WssServerList -Arguments @{} -Config (New-TestConfig)
+        $r.access_policy.rule_counts['share-policy'] | Should -Be 2
+        $r.access_policy.policy_files[0].share | Should -Be '\\fs01\data'
+        ($r.servers[0].shares | Where-Object name -eq 'hr').blocked_by_policy | Should -Match 'group-policy'
     }
 }
 

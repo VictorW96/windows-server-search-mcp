@@ -40,6 +40,13 @@
       "default": "",
       "required": false
     },
+    "deny_paths": {
+      "type": "string",
+      "title": "Blocked paths",
+      "description": "Optional. Wildcard patterns Claude may never search, list, read or copy, separated by ';' (e.g. \\\\fs01\\hr\\**;**\\Personal;**\\*.kdbx). IT can also block paths centrally via a .claude-policy file in each share or Group Policy.",
+      "default": "",
+      "required": false
+    },
     "max_results": {
       "type": "number",
       "title": "Default maximum results",

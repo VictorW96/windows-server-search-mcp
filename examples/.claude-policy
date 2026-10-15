@@ -1,0 +1,27 @@
+# .claude-policy - place this file in the ROOT of a file share (e.g. \\fs01\projects\.claude-policy).
+# Every PC running the windows-server-search Claude plugin picks it up automatically (re-read every 5 minutes).
+# Claude can neither find (search), list, read nor copy matching files and folders.
+#
+# Syntax (like .gitignore, case-insensitive, / and \ both work):
+#   name          matches a file or folder with that name at any depth in this share
+#   /name         only directly in the share root
+#   a/b           a path relative to the share root (anchored because it contains a slash)
+#   *             any characters within one name     ?   one character
+#   **            any number of folders
+# A matching folder blocks everything below it. Lines starting with # are comments.
+# "!" negations are not supported (rules can only block, never re-allow).
+# Protect this file with NTFS permissions so that only administrators can change it.
+
+# Personal folders anywhere in the share
+Personal/
+
+# HR and payroll data in the share root
+/HR
+/Payroll*
+
+# Contracts folders one level below any project
+*/Contracts/
+
+# Sensitive file types
+*.kdbx
+*.pfx

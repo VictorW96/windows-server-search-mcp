@@ -16,7 +16,8 @@
         "WSS_AUTO_DISCOVER": "${user_config.auto_discover}",
         "WSS_EXCLUDE": "${user_config.exclude}",
         "WSS_MAX_RESULTS": "${user_config.max_results}",
-        "WSS_DOWNLOAD_DIR": "${user_config.download_dir}"
+        "WSS_DOWNLOAD_DIR": "${user_config.download_dir}",
+        "WSS_DENY": "${user_config.deny_paths}"
       }
     }
   }
