@@ -137,7 +137,8 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
 
     It 'copies several files, reporting per-file errors' {
         $r = Get-ToolJson ($Msgs | Where-Object id -eq 10)
-        $r.destination | Should -Be (Join-Path $CopyDir 'batch')
+        # %TEMP% may use 8.3 short names (RUNNER~1); compare the actual folders instead of strings.
+        (Get-Item -LiteralPath $r.destination).FullName | Should -Be (Get-Item -LiteralPath (Join-Path $CopyDir 'batch')).FullName
         @($r.copied).Count | Should -Be 2
         Test-Path (Join-Path $CopyDir 'batch\beta notes.txt') | Should -BeTrue
         @($r.errors).Count | Should -Be 1
