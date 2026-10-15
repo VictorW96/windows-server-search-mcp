@@ -118,7 +118,10 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         $names = @($r.results | ForEach-Object { $_.name })
         $names | Should -Contain 'alpha.txt'
         $names | Should -Contain 'beta notes.txt'
-        $alpha = $r.results | Where-Object name -eq 'alpha.txt'
+        # files uploaded by save_file in an earlier run may be indexed too, so pick the original
+        $alpha = @($r.results | Where-Object { $_.name -eq 'alpha.txt' -and $_.drive_path -eq "$($Env.Drive)\alpha.txt" })
+        $alpha.Count | Should -Be 1
+        $alpha = $alpha[0]
         $alpha.drive_path | Should -Be "$($Env.Drive)\alpha.txt"
         $alpha.path | Should -BeLike "\\*\$($Env.Share)\alpha.txt"
         $alpha.size | Should -BeGreaterThan 0
