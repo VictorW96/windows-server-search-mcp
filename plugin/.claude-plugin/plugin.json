@@ -1,12 +1,23 @@
 {
   "name": "windows-server-search",
   "version": "__VERSION__",
-  "description": "Search Windows file servers through their Windows Search index. Automatically uses the network drives already mapped on this PC (e.g. Z: -> \\\\fileserver\\share); no setup needed. Windows only.",
-  "author": { "name": "Victor Wolf", "url": "https://github.com/VictorW96" },
+  "description": "Search and read files on Windows file servers through their Windows Search index, and copy them into your workspace. Automatically uses the network drives already mapped on this PC (e.g. Z: -> \\\\fileserver\\share); no setup needed. Windows only.",
+  "author": {
+    "name": "Victor Wolf",
+    "url": "https://github.com/VictorW96"
+  },
   "homepage": "https://github.com/VictorW96/windows-server-search-mcp",
   "repository": "https://github.com/VictorW96/windows-server-search-mcp",
   "license": "MIT",
-  "keywords": ["windows", "search", "file-server", "smb", "network-drive", "windows-search", "mcp"],
+  "keywords": [
+    "windows",
+    "search",
+    "file-server",
+    "smb",
+    "network-drive",
+    "windows-search",
+    "mcp"
+  ],
   "userConfig": {
     "servers": {
       "type": "string",
@@ -36,6 +47,13 @@
       "default": 50,
       "min": 1,
       "max": 500,
+      "required": false
+    },
+    "download_dir": {
+      "type": "directory",
+      "title": "Download folder",
+      "description": "Optional. Local folder that copy_file uses when no destination is given (e.g. your Cowork workspace folder). Default: Downloads\\Windows Server Search.",
+      "default": "",
       "required": false
     }
   }

@@ -56,6 +56,12 @@ BeforeAll {
 if ($Hosts.Count -eq 0) { $Hosts = @(@{ Name = 'n/a (no integration-env.json)'; Exe = '' }) }
 Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
     BeforeAll {
+        # Simulate a Cowork workspace folder inside the user profile, identified by a marker file.
+        $script:Marker = '.wss-target-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+        $script:Workspace = Join-Path $env:USERPROFILE ("Documents\Claude\ws-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        New-Item -ItemType Directory -Path $Workspace -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Workspace $Marker) -Value ''
+        $script:CopyDir = Join-Path $env:TEMP ("wss-copy-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
         $script:Msgs = @(Invoke-Mcp $Exe @(
                 (Call 1 'list_servers' @{ check = $true }),
                 (Call 2 'search_files' @{ query = $Env.Token }),
@@ -64,7 +70,11 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
                 (Call 5 'search_files' @{ extensions = @('log'); sort = 'modified' }),
                 (Call 6 'read_file' @{ path = "$($Env.Drive)\alpha.txt" }),
                 (Call 7 'list_directory' @{ path = "$($Env.Drive)\" }),
-                (Call 8 'read_file' @{ path = 'C:\Windows\win.ini' })
+                (Call 8 'read_file' @{ path = 'C:\Windows\win.ini' }),
+                (Call 9 'copy_file' @{ path = "$($Env.Drive)\alpha.txt"; destination_marker = $Marker }),
+                (Call 10 'copy_file' @{ paths = @("$($Env.Drive)\alpha.txt", "\\$($Env.Computer)\$($Env.Share)\sub folder\beta notes.txt", "$($Env.Drive)\missing.txt"); destination = $CopyDir; subfolder = 'batch' }),
+                (Call 11 'copy_file' @{ path = "$($Env.Drive)\alpha.txt"; destination = "$($Env.Drive)\sub folder" }),
+                (Call 12 'copy_file' @{ path = 'C:\Windows\win.ini'; destination = $CopyDir })
             ))
     }
 
@@ -115,6 +125,33 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         $r = Get-ToolJson ($Msgs | Where-Object id -eq 7)
         @($r.entries | ForEach-Object { $_.name }) | Should -Contain 'sub folder'
         @($r.entries | ForEach-Object { $_.name }) | Should -Contain 'alpha.txt'
+    }
+
+    It 'copies a file into the workspace folder found via marker' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 9)
+        $r.destination | Should -Be $Workspace
+        $r.destination_source | Should -Be 'marker'
+        $r.copied[0].local_path | Should -Be (Join-Path $Workspace 'alpha.txt')
+        Get-Content -LiteralPath (Join-Path $Workspace 'alpha.txt') -Raw | Should -Match $Env.Token
+    }
+
+    It 'copies several files, reporting per-file errors' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 10)
+        $r.destination | Should -Be (Join-Path $CopyDir 'batch')
+        @($r.copied).Count | Should -Be 2
+        Test-Path (Join-Path $CopyDir 'batch\beta notes.txt') | Should -BeTrue
+        @($r.errors).Count | Should -Be 1
+        $r.errors[0].error | Should -Match 'not found'
+    }
+
+    It 'never writes to the server' {
+        $m = $Msgs | Where-Object id -eq 11
+        $m.result.isError | Should -BeTrue
+        $m.result.content[0].text | Should -Match 'network drive'
+    }
+
+    It 'refuses to copy local files outside the server shares' {
+        ($Msgs | Where-Object id -eq 12).result.isError | Should -BeTrue
     }
 
     It 'refuses to read local files outside the server shares' {

@@ -380,6 +380,82 @@ Describe 'Get-WssDocumentText' {
     }
 }
 
+Describe 'copy_file helpers' {
+    BeforeAll {
+        $script:Base = Join-Path ([IO.Path]::GetTempPath()) "wss-copy-$([guid]::NewGuid())"
+        New-Item -ItemType Directory -Path (Join-Path $Base 'src') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $Base 'dst') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Base 'src/report.pdf') -Value 'PDFDATA'
+        (Get-Item (Join-Path $Base 'src/report.pdf')).LastWriteTimeUtc = [datetime]'2020-01-02T03:04:05Z'
+    }
+    AfterAll { Remove-Item $Base -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'copies a file and preserves the modified time' {
+        $r = Copy-WssOneFile -Source (Join-Path $Base 'src/report.pdf') -DestinationDir (Join-Path $Base 'dst')
+        $r.local_path | Should -Be (Join-Path $Base 'dst/report.pdf')
+        Get-Content -LiteralPath $r.local_path | Should -Be 'PDFDATA'
+        (Get-Item $r.local_path).LastWriteTimeUtc | Should -Be ([datetime]'2020-01-02T03:04:05Z').ToUniversalTime()
+        $r.Contains('renamed_to') | Should -BeFalse
+    }
+    It 'never overwrites by default but creates a numbered copy' {
+        $r = Copy-WssOneFile -Source (Join-Path $Base 'src/report.pdf') -DestinationDir (Join-Path $Base 'dst')
+        $r.renamed_to | Should -Be 'report (1).pdf'
+        $r2 = Copy-WssOneFile -Source (Join-Path $Base 'src/report.pdf') -DestinationDir (Join-Path $Base 'dst')
+        $r2.renamed_to | Should -Be 'report (2).pdf'
+    }
+    It 'overwrites when asked' {
+        Set-Content -LiteralPath (Join-Path $Base 'dst/report.pdf') -Value 'OLD'
+        $r = Copy-WssOneFile -Source (Join-Path $Base 'src/report.pdf') -DestinationDir (Join-Path $Base 'dst') -Overwrite $true
+        $r.local_path | Should -Be (Join-Path $Base 'dst/report.pdf')
+        Get-Content -LiteralPath $r.local_path | Should -Be 'PDFDATA'
+    }
+    It 'enforces the size limit and rejects folders' {
+        { Copy-WssOneFile -Source (Join-Path $Base 'src/report.pdf') -DestinationDir (Join-Path $Base 'dst') -MaxBytes 2 } | Should -Throw '*copy limit*'
+        { Copy-WssOneFile -Source (Join-Path $Base 'src') -DestinationDir (Join-Path $Base 'dst') } | Should -Throw '*is a folder*'
+        { Copy-WssOneFile -Source (Join-Path $Base 'src/missing.pdf') -DestinationDir (Join-Path $Base 'dst') } | Should -Throw '*not found*'
+    }
+    It 'finds the workspace folder by marker file' {
+        $ws = Join-Path $Base 'profile/Documents/Claude/My Project'
+        New-Item -ItemType Directory -Path $ws -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $Base 'profile/AppData/x') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Base 'profile/AppData/x/.wss-target-abc12345') -Value ''
+        Set-Content -LiteralPath (Join-Path $ws '.wss-target-abc12345') -Value ''
+        Find-WssMarkerDirectory -Marker '.wss-target-abc12345' -Roots @(Join-Path $Base 'profile') | Should -Be $ws
+    }
+    It 'rejects bad or unknown markers' {
+        { Find-WssMarkerDirectory -Marker '../etc' -Roots @($Base) } | Should -Throw '*Invalid destination_marker*'
+        { Find-WssMarkerDirectory -Marker 'short' -Roots @($Base) } | Should -Throw '*Invalid destination_marker*'
+        { Find-WssMarkerDirectory -Marker '.wss-target-nothere99' -Roots @($Base) } | Should -Throw '*Could not find*'
+    }
+    It 'validates local destinations' {
+        { Resolve-WssLocalDestination '' @() } | Should -Throw
+        if ($IsWindows -or $PSVersionTable.PSVersion.Major -lt 6) {
+            { Resolve-WssLocalDestination '\\fs01\share\x' @() } | Should -Throw '*network path*'
+            { Resolve-WssLocalDestination 'relative\dir' @() } | Should -Throw '*absolute*'
+            $t = @(@{ Name = 'fs01'; Machine = 'fs01'; Shares = @(@{ Unc = '\\fs01\p'; Drives = @('Q:') }) })
+            { Resolve-WssLocalDestination 'Q:\x' $t } | Should -Throw '*mapped network drive*'
+            Resolve-WssLocalDestination '%TEMP%\x' @() | Should -Be ([IO.Path]::GetFullPath((Join-Path $env:TEMP 'x')))
+        } else {
+            { Resolve-WssLocalDestination 'relative/dir' @() } | Should -Throw '*absolute*'
+            Resolve-WssLocalDestination '/tmp/x/../y' @() | Should -Be '/tmp/y'
+        }
+    }
+    It 'requires a source path' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        { Copy-WssFiles -Arguments @{} -Config (New-TestConfig) } | Should -Throw '*Provide path*'
+    }
+    It 'reports per-file errors when nothing could be copied' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        $cfg = New-TestConfig; $cfg.MaxCopyMB = 1
+        { Copy-WssFiles -Arguments @{ paths = @('\\evil\x\y.pdf'); destination = (Join-Path $Base 'dst') } -Config $cfg } | Should -Throw '*outside the known*'
+    }
+    It 'rejects subfolder traversal' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        $cfg = New-TestConfig; $cfg.MaxCopyMB = 1
+        { Copy-WssFiles -Arguments @{ path = '\\fs01\p\a.pdf'; destination = (Join-Path $Base 'dst'); subfolder = '../escape' } -Config $cfg } | Should -Throw '*Invalid subfolder*'
+    }
+}
+
 Describe 'MCP protocol' {
     It 'answers initialize with negotiated version' {
         $r = Invoke-WssMessageLine '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}' | ConvertFrom-Json
@@ -398,7 +474,8 @@ Describe 'MCP protocol' {
     }
     It 'lists tools with schemas' {
         $r = Invoke-WssMessageLine '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | ConvertFrom-Json
-        @($r.result.tools.name) | Should -Be @('list_servers', 'search_files', 'read_file', 'list_directory')
+        @($r.result.tools.name) | Should -Be @('list_servers', 'search_files', 'read_file', 'list_directory', 'copy_file')
+        ($r.result.tools | Where-Object name -eq 'copy_file').annotations.readOnlyHint | Should -BeFalse
         foreach ($t in $r.result.tools) { $t.inputSchema.type | Should -Be 'object' }
         @(($r.result.tools | Where-Object name -eq 'read_file').inputSchema.required) | Should -Be @('path')
     }

@@ -35,8 +35,23 @@ so the server sees your mapped drives and Windows credentials.
 | `search_files` | Index search: `query` (words, `"phrases"`, `-exclude`, `OR`), `match` (all/filename/contents), `server`, `path` (`Z:\folder` or UNC), `extensions`, `kind`, `author`, `modified_after/before`, `sort`, `max_results` |
 | `read_file` | Text of a file on a known share: text formats, `.docx`, `.xlsx`, `.pptx`; chunked via `offset` |
 | `list_directory` | Folder listing on a known share |
+| `copy_file` | Copies one or more files (any format) from a share to a **local** folder, e.g. the Cowork workspace, so Claude can work on PDFs, images and spreadsheets with its own tools |
 
-`read_file` and `list_directory` only accept paths inside the discovered or configured shares.
+`read_file`, `list_directory` and `copy_file` only accept source paths inside the discovered or configured shares.
+
+### Copying files into the Cowork workspace
+
+The MCP server runs on Windows. Claude sees its Cowork workspace folder only at its path inside the VM,
+not at the Windows path. `copy_file` bridges the two with a marker file:
+
+1. Claude creates an empty file with a random name, e.g. `.wss-target-7f3k9q2m`, in its workspace folder.
+2. Claude calls `copy_file` with `destination_marker: ".wss-target-7f3k9q2m"`.
+3. The server searches the user profile and OneDrive folders for the marker. It skips `AppData`, hidden
+   folders and links, and caches the result per session. The files are copied next to the marker.
+
+Alternatively, pass `destination` as a Windows path, or set the **Download folder** plugin option.
+Copies never overwrite existing files unless `overwrite: true`; a numbered copy is created instead.
+Copies never go to UNC paths or network drives, and each file has a size limit (`WSS_MAX_COPY_MB`, default 500).
 
 ## Configuration
 
@@ -49,6 +64,8 @@ All options are optional.
 | Use mapped network drives | `WSS_AUTO_DISCOVER` | `true` | Auto-discover servers from mapped drives (CIM `Win32_LogicalDisk`, `HKCU\Network`, PSDrives) |
 | Exclude servers / shares | `WSS_EXCLUDE` | – | `;`-separated server names or UNC shares to ignore |
 | Default maximum results | `WSS_MAX_RESULTS` | `50` | 1–500 |
+| Download folder | `WSS_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads\Windows Server Search` | Default destination for `copy_file` |
+| – | `WSS_MAX_COPY_MB` | `500` | Maximum size per copied file |
 | – | `WSS_QUERY_TIMEOUT` | `30` | Seconds per index query |
 | – | `WSS_USE_NETBIOS` | `true` | Query FQDN hosts by their NetBIOS name, which Windows Search requires |
 | – | `WSS_CONFIG_FILE` | `%APPDATA%\windows-server-search-mcp\config.json` | JSON file with `servers`, `exclude`, `autoDiscover`, `maxResults`, … |
@@ -84,8 +101,9 @@ Most of us have no Windows file server at hand, so the tests run in three layers
    its own file server. `Setup-WindowsSearch.ps1` enables `WSearch`, creates test files, adds them to the
    crawl scope over COM, shares the folder over SMB and maps it as drive `W:`. The tests then start the real
    server under both `powershell.exe` 5.1 and `pwsh` 7. They check that the drive is auto-discovered and run
-   **remote-syntax** queries (`RUNNER.SystemIndex` + `file://RUNNER/wsstest`), `read_file` and
-   `list_directory`.
+   **remote-syntax** queries (`RUNNER.SystemIndex` + `file://RUNNER/wsstest`), `read_file`,
+   `list_directory` and `copy_file`. The `copy_file` checks include a simulated Cowork workspace found via
+   the marker file, a batch copy with per-file errors, and refusing to write to the network drive.
 
 Run locally (any OS with PowerShell 7 or Docker):
 

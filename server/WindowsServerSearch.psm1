@@ -85,6 +85,8 @@ function Get-WssConfig {
         WSS_MAX_RESULTS      default result limit (default 50, max 500)
         WSS_QUERY_TIMEOUT    seconds per index query (default 30)
         WSS_USE_NETBIOS      true|false (default true) - query FQDN hosts by short name
+        WSS_DOWNLOAD_DIR     default local folder for copy_file
+        WSS_MAX_COPY_MB      maximum size per copied file in MB (default 500)
         WSS_CONFIG_FILE      path to JSON config file (default %APPDATA%\windows-server-search-mcp\config.json)
     #>
     $file = @{}
@@ -121,6 +123,8 @@ function Get-WssConfig {
         MaxResults     = ConvertTo-WssInt (Pick 'WSS_MAX_RESULTS' 'maxResults') 50 1 500
         QueryTimeout   = ConvertTo-WssInt (Pick 'WSS_QUERY_TIMEOUT' 'queryTimeout') 30 1 600
         UseNetBios     = ConvertTo-WssBool (Pick 'WSS_USE_NETBIOS' 'useNetBios') $true
+        DownloadDir    = (Pick 'WSS_DOWNLOAD_DIR' 'downloadDir')
+        MaxCopyMB      = ConvertTo-WssInt (Pick 'WSS_MAX_COPY_MB' 'maxCopyMB') 500 1 102400
         ConfigFile     = $path
     }
 }
@@ -917,6 +921,177 @@ function Get-WssDirectoryListing {
 }
 
 # ---------------------------------------------------------------------------
+# Copying files to the local PC (e.g. into the Claude Cowork workspace folder)
+# ---------------------------------------------------------------------------
+
+$script:WorkspaceCache = @{}
+
+function Get-WssUniquePath {
+    <# Returns Directory\Name, or "Name (n).ext" if that file already exists. #>
+    param([string]$Directory, [string]$Name)
+    $candidate = [IO.Path]::Combine($Directory, $Name)
+    if (-not (Test-Path -LiteralPath $candidate)) { return $candidate }
+    $base = [IO.Path]::GetFileNameWithoutExtension($Name)
+    $ext = [IO.Path]::GetExtension($Name)
+    for ($i = 1; $i -lt 10000; $i++) {
+        $candidate = [IO.Path]::Combine($Directory, "$base ($i)$ext")
+        if (-not (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    throw "Could not find a free file name for '$Name' in '$Directory'."
+}
+
+function Resolve-WssLocalDestination {
+    <#
+      Validates a local destination folder: must be an absolute path on a local disk,
+      never a UNC path or a mapped network drive (copy_file must not write to servers).
+    #>
+    param([string]$Path, $Targets)
+    if (-not $Path -or -not $Path.Trim()) { throw 'destination is empty' }
+    $p = [Environment]::ExpandEnvironmentVariables($Path.Trim())
+    if ($p -eq '~' -or $p.StartsWith('~/') -or $p.StartsWith('~\')) {
+        $p = [Environment]::GetFolderPath('UserProfile') + $p.Substring(1)
+    }
+    if (Test-WssIsWindows) {
+        $p = $p -replace '/', '\'
+        if ($p.StartsWith('\\')) { throw "Destination '$Path' is a network path. copy_file only writes to local folders on this PC." }
+        if ($p -notmatch '^[A-Za-z]:\\') { throw "Destination '$Path' must be an absolute local Windows path such as C:\Users\me\Documents\Claude." }
+        $drive = $p.Substring(0, 2).ToUpperInvariant()
+        foreach ($srv in $Targets) {
+            foreach ($sh in $srv.Shares) {
+                if ($sh.Drives -contains $drive) { throw "Destination '$Path' is on mapped network drive $drive. copy_file only writes to local folders on this PC." }
+            }
+        }
+        try {
+            if ((New-Object IO.DriveInfo($drive)).DriveType -eq [IO.DriveType]::Network) {
+                throw "Destination '$Path' is on network drive $drive. copy_file only writes to local folders on this PC."
+            }
+        } catch [System.ArgumentException] { }
+    } elseif (-not [IO.Path]::IsPathRooted($p)) {
+        throw "Destination '$Path' must be an absolute path."
+    }
+    return [IO.Path]::GetFullPath($p)
+}
+
+function Find-WssMarkerDirectory {
+    <#
+      Locates the folder containing a marker file (created by Claude inside its Cowork
+      workspace folder) by searching the user's profile and OneDrive folders.
+    #>
+    param([string]$Marker, [string[]]$Roots = $null, [int]$MaxDepth = 6, [int]$TimeoutSeconds = 20)
+    if ($Marker -notmatch '^[A-Za-z0-9._-]{8,128}$') {
+        throw "Invalid destination_marker '$Marker' (8-128 characters: letters, digits, '.', '_' or '-')."
+    }
+    if ($script:WorkspaceCache.ContainsKey($Marker)) { return $script:WorkspaceCache[$Marker] }
+    if (-not $Roots) {
+        $Roots = @()
+        foreach ($r in @($env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer, [Environment]::GetFolderPath('UserProfile'))) {
+            if ($r -and (Test-Path -LiteralPath $r) -and -not ($Roots -contains $r)) { $Roots += $r }
+        }
+    }
+    $skip = @('AppData', 'node_modules', '$Recycle.Bin', 'Application Data', 'Local Settings')
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $queue = New-Object System.Collections.Queue
+    foreach ($r in $Roots) { $queue.Enqueue(@($r, 0)) }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    while ($queue.Count -gt 0) {
+        if ((Get-Date) -gt $deadline) { break }
+        $item = $queue.Dequeue()
+        $dir = $item[0]; $depth = $item[1]
+        if (-not $seen.Add($dir)) { continue }
+        if (Test-Path -LiteralPath ([IO.Path]::Combine($dir, $Marker)) -PathType Leaf) {
+            $script:WorkspaceCache[$Marker] = $dir
+            return $dir
+        }
+        if ($depth -ge $MaxDepth) { continue }
+        try {
+            foreach ($sub in [IO.Directory]::GetDirectories($dir)) {
+                $name = [IO.Path]::GetFileName($sub)
+                if ($name.StartsWith('.') -or ($skip -contains $name)) { continue }
+                try {
+                    if (([IO.File]::GetAttributes($sub) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                } catch { continue }
+                $queue.Enqueue(@($sub, ($depth + 1)))
+            }
+        } catch { }
+    }
+    throw "Could not find a folder containing the marker file '$Marker' in the user profile ($($Roots -join ', ')). Create the marker in the Cowork workspace folder first, or pass destination as a Windows path."
+}
+
+function Copy-WssOneFile {
+    <# Copies one (already validated) source file into DestinationDir. #>
+    param([string]$Source, [string]$DestinationDir, [bool]$Overwrite = $false, [int64]$MaxBytes = 500MB)
+    if (Test-Path -LiteralPath $Source -PathType Container) { throw 'is a folder; use list_directory and copy the files you need.' }
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw 'file not found.' }
+    $item = Get-Item -LiteralPath $Source -Force
+    if ($item.Length -gt $MaxBytes) { throw "file is larger than the copy limit ($([Math]::Round($MaxBytes / 1MB)) MB)." }
+    $name = $item.Name
+    if ($Overwrite) { $target = [IO.Path]::Combine($DestinationDir, $name) } else { $target = Get-WssUniquePath $DestinationDir $name }
+    [IO.File]::Copy($item.FullName, $target, $Overwrite)
+    try { [IO.File]::SetLastWriteTimeUtc($target, $item.LastWriteTimeUtc) } catch { }
+    $result = [ordered]@{ local_path = $target; size = [int64]$item.Length; modified = ConvertTo-WssIso $item.LastWriteTime }
+    if ([IO.Path]::GetFileName($target) -ne $name) { $result.renamed_to = [IO.Path]::GetFileName($target) }
+    return $result
+}
+
+function Copy-WssFiles {
+    param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig), $Targets = $null)
+    if ($null -eq $Targets) { $Targets = @(Get-WssTargets -Config $Config) }
+
+    $sources = @()
+    if ($Arguments.path) { $sources += "$($Arguments.path)" }
+    if ($Arguments.paths) { foreach ($x in @($Arguments.paths)) { if ($x -and -not ($sources -contains "$x")) { $sources += "$x" } } }
+    if ($sources.Count -eq 0) { throw 'Provide path (one file) or paths (several files) to copy.' }
+    if ($sources.Count -gt 50) { throw 'At most 50 files can be copied per call.' }
+
+    $destSource = 'argument'
+    if ($Arguments.destination_marker) {
+        $dest = Find-WssMarkerDirectory -Marker "$($Arguments.destination_marker)"
+        $destSource = 'marker'
+    } elseif ($Arguments.destination) {
+        $dest = "$($Arguments.destination)"
+    } elseif ($Config.DownloadDir) {
+        $dest = "$($Config.DownloadDir)"; $destSource = 'config'
+    } else {
+        $dest = [IO.Path]::Combine([Environment]::GetFolderPath('UserProfile'), 'Downloads', 'Windows Server Search')
+        $destSource = 'default'
+    }
+    $dest = Resolve-WssLocalDestination $dest $Targets
+    if ($Arguments.subfolder) {
+        $sub = "$($Arguments.subfolder)"
+        if ($sub -match '(^|[\\/])\.\.([\\/]|$)' -or [IO.Path]::IsPathRooted($sub) -or $sub -match '[:*?"<>|]') { throw "Invalid subfolder '$sub'." }
+        $dest = [IO.Path]::GetFullPath([IO.Path]::Combine($dest, $sub))
+    }
+    if (-not (Test-Path -LiteralPath $dest -PathType Container)) { [void](New-Item -ItemType Directory -Path $dest -Force) }
+
+    $overwrite = ConvertTo-WssBool $Arguments.overwrite $false
+    $maxBytes = [int64]$Config.MaxCopyMB * 1MB
+    $copied = New-Object System.Collections.ArrayList
+    $errors = New-Object System.Collections.ArrayList
+    foreach ($src in $sources) {
+        try {
+            $unc = Resolve-WssPath $src $Targets
+            $r = Copy-WssOneFile -Source $unc -DestinationDir $dest -Overwrite $overwrite -MaxBytes $maxBytes
+            $entry = [ordered]@{ source = $unc }
+            $drivePath = Convert-WssUncToDrivePath $unc $Targets
+            if ($drivePath) { $entry.source_drive_path = $drivePath }
+            foreach ($k in $r.Keys) { $entry[$k] = $r[$k] }
+            [void]$copied.Add($entry)
+        } catch {
+            [void]$errors.Add([ordered]@{ source = $src; error = $_.Exception.Message })
+        }
+    }
+    if ($copied.Count -eq 0) {
+        throw ('No file was copied: ' + (($errors | ForEach-Object { "$($_.source): $($_.error)" }) -join ' | '))
+    }
+    $out = [ordered]@{ destination = $dest; destination_source = $destSource; copied = @($copied) }
+    if ($errors.Count -gt 0) { $out.errors = @($errors) }
+    if ($destSource -eq 'default') {
+        $out.note = 'Copied to the default download folder. In Claude Cowork this folder is not visible in your workspace: pass destination_marker (or destination) so files land in the folder connected to the session.'
+    }
+    return $out
+}
+
+# ---------------------------------------------------------------------------
 # MCP protocol
 # ---------------------------------------------------------------------------
 
@@ -986,6 +1161,23 @@ function Get-WssToolDefinitions {
                 required   = @('path')
             }
             annotations = @{ readOnlyHint = $true; openWorldHint = $false }
+        },
+        [ordered]@{
+            name        = 'copy_file'
+            title       = 'Copy files from Windows server to this PC'
+            description = 'Copies files from a known Windows server share to a local folder on this PC so they can be opened or processed with other tools (PDFs, images, large spreadsheets, any format). In Claude Cowork: first create an empty marker file with a unique name (e.g. .wss-target-7f3k9q2m) in your workspace folder, then pass that name as destination_marker; the server finds the matching Windows folder and copies the files next to the marker. Existing files are never overwritten unless overwrite=true (a numbered copy such as "report (1).pdf" is created instead). Never writes to the server.'
+            inputSchema = [ordered]@{
+                type       = 'object'
+                properties = [ordered]@{
+                    path               = @{ type = 'string'; description = 'File to copy: UNC path (\\server\share\dir\file.pdf) or mapped drive path (Z:\dir\file.pdf).' }
+                    paths              = @{ type = 'array'; items = @{ type = 'string' }; maxItems = 50; description = 'Several files to copy (alternative to path).' }
+                    destination_marker = @{ type = 'string'; description = 'Name of a marker file you created in the destination folder (8-128 chars of letters, digits, . _ -). Recommended in Cowork: the files are copied into the folder that contains this marker.' }
+                    destination        = @{ type = 'string'; description = 'Absolute local Windows folder, e.g. C:\Users\me\Documents\Claude. Default: the configured download folder, else %USERPROFILE%\Downloads\Windows Server Search.' }
+                    subfolder          = @{ type = 'string'; description = 'Optional relative sub-folder inside the destination (created if missing).' }
+                    overwrite          = @{ type = 'boolean'; default = $false; description = 'Replace existing files with the same name.' }
+                }
+            }
+            annotations = @{ readOnlyHint = $false; destructiveHint = $false; idempotentHint = $false; openWorldHint = $false }
         }
     )
 }
@@ -1020,6 +1212,7 @@ function Invoke-WssTool {
         'search_files' { return Search-Wss -Arguments $Arguments }
         'read_file' { return Read-WssFile -Arguments $Arguments }
         'list_directory' { return Get-WssDirectoryListing -Arguments $Arguments }
+        'copy_file' { return Copy-WssFiles -Arguments $Arguments }
         default { throw [System.Collections.Generic.KeyNotFoundException]::new("Unknown tool: $Name") }
     }
 }
@@ -1058,7 +1251,7 @@ function Invoke-WssRequest {
                     protocolVersion = $version
                     capabilities    = [ordered]@{ tools = [ordered]@{ listChanged = $false } }
                     serverInfo      = [ordered]@{ name = $script:ServerName; title = 'Windows Server Search'; version = $script:ServerVersion }
-                    instructions    = 'Search files on Windows file servers through their Windows Search index. Call list_servers first to see available servers/shares, then search_files; use read_file to read results.'
+                    instructions    = 'Search files on Windows file servers through their Windows Search index. Call list_servers first to see available servers/shares, then search_files; use read_file to read results as text, or copy_file to copy files into your workspace (e.g. PDFs or images).'
                 })
         }
         'ping' { return New-WssResponse $id @{} }
