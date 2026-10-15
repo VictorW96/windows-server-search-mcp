@@ -1,0 +1,1163 @@
+# WindowsServerSearch.psm1
+# Core logic for the Windows Server Search MCP server.
+# Compatible with Windows PowerShell 5.1 and PowerShell 7+ (no external modules).
+
+
+$script:ServerName = 'windows-server-search'
+$script:ServerVersion = '0.0.0-dev'
+$script:SupportedProtocolVersions = @('2025-06-18', '2025-03-26', '2024-11-05')
+
+# Pluggable backends. Tests (and WSS_FAKE_BACKEND) replace these.
+$script:QueryExecutor = $null      # scriptblock: param($Machine, $Sql, $TimeoutSeconds) -> array of hashtables
+$script:DriveProvider = $null      # scriptblock: -> array of @{ Drive='Z:'; Unc='\\srv\share' }
+$script:ShareProvider = $null      # scriptblock: param($HostName) -> array of share names
+
+$script:ResultColumns = @(
+    'System.ItemUrl',
+    'System.ItemPathDisplay',
+    'System.FileName',
+    'System.ItemTypeText',
+    'System.Size',
+    'System.DateModified',
+    'System.DateCreated',
+    'System.Author',
+    'System.Title',
+    'System.Kind',
+    'System.Search.Rank'
+)
+
+# ---------------------------------------------------------------------------
+# Logging (stderr only - stdout is reserved for JSON-RPC)
+# ---------------------------------------------------------------------------
+
+function Write-WssLog {
+    param([string]$Message)
+    if ($env:WSS_LOG_LEVEL -eq 'silent') { return }
+    try { [Console]::Error.WriteLine("[$script:ServerName] $Message") } catch { }
+}
+
+function Set-WssVersion {
+    param([string]$Version)
+    if ($Version) { $script:ServerVersion = $Version }
+}
+
+function Test-WssIsWindows {
+    if ($PSVersionTable.PSVersion.Major -lt 6) { return $true }
+    return [bool]$IsWindows
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+function ConvertTo-WssBool {
+    param($Value, [bool]$Default)
+    if ($null -eq $Value) { return $Default }
+    $s = "$Value".Trim().ToLowerInvariant()
+    if ($s -eq '') { return $Default }
+    if ($s -in @('1', 'true', 'yes', 'on', 'y')) { return $true }
+    if ($s -in @('0', 'false', 'no', 'off', 'n')) { return $false }
+    return $Default
+}
+
+function ConvertTo-WssInt {
+    param($Value, [int]$Default, [int]$Min = 1, [int]$Max = [int]::MaxValue)
+    $n = 0
+    if ($null -eq $Value -or -not [int]::TryParse("$Value".Trim(), [ref]$n)) { return $Default }
+    if ($n -lt $Min) { return $Min }
+    if ($n -gt $Max) { return $Max }
+    return $n
+}
+
+function Split-WssList {
+    param([string]$Value)
+    if (-not $Value) { return @() }
+    return @($Value -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Get-WssConfig {
+    <#
+      Reads configuration from environment variables (set by the plugin's userConfig)
+      and an optional JSON config file. Environment variables win.
+        WSS_SERVERS          ; or , separated UNC roots, e.g. \\fs01\projects;\\fs02
+        WSS_AUTO_DISCOVER    true|false (default true) - use mapped network drives
+        WSS_EXCLUDE          ; separated server names or UNC roots to ignore
+        WSS_MAX_RESULTS      default result limit (default 50, max 500)
+        WSS_QUERY_TIMEOUT    seconds per index query (default 30)
+        WSS_USE_NETBIOS      true|false (default true) - query FQDN hosts by short name
+        WSS_CONFIG_FILE      path to JSON config file (default %APPDATA%\windows-server-search-mcp\config.json)
+    #>
+    $file = @{}
+    $path = $env:WSS_CONFIG_FILE
+    if (-not $path -and $env:APPDATA) {
+        $path = [IO.Path]::Combine($env:APPDATA, 'windows-server-search-mcp', 'config.json')
+    }
+    if ($path -and (Test-Path -LiteralPath $path)) {
+        try {
+            $obj = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            foreach ($p in $obj.PSObject.Properties) { $file[$p.Name] = $p.Value }
+        } catch {
+            Write-WssLog "Ignoring unreadable config file '$path': $($_.Exception.Message)"
+        }
+    }
+
+    function Pick($envName, $fileKey) {
+        $v = [Environment]::GetEnvironmentVariable($envName)
+        if ($null -ne $v -and "$v".Trim() -ne '') { return $v }
+        if ($file.ContainsKey($fileKey)) {
+            $fv = $file[$fileKey]
+            if ($fv -is [array]) { return ($fv -join ';') }
+            return $fv
+        }
+        return $null
+    }
+
+    return @{
+        Servers        = @(Split-WssList (Pick 'WSS_SERVERS' 'servers'))
+        AutoDiscover   = ConvertTo-WssBool (Pick 'WSS_AUTO_DISCOVER' 'autoDiscover') $true
+        Exclude        = @(Split-WssList (Pick 'WSS_EXCLUDE' 'exclude'))
+        MaxResults     = ConvertTo-WssInt (Pick 'WSS_MAX_RESULTS' 'maxResults') 50 1 500
+        QueryTimeout   = ConvertTo-WssInt (Pick 'WSS_QUERY_TIMEOUT' 'queryTimeout') 30 1 600
+        UseNetBios     = ConvertTo-WssBool (Pick 'WSS_USE_NETBIOS' 'useNetBios') $true
+        ConfigFile     = $path
+    }
+}
+
+# ---------------------------------------------------------------------------
+# UNC / path helpers
+# ---------------------------------------------------------------------------
+
+function ConvertFrom-WssUncPath {
+    <# Parses \\host\share\rest (or //host/share/rest, file://host/share/rest). Returns $null if not UNC. #>
+    param([string]$Path)
+    if (-not $Path) { return $null }
+    $p = $Path.Trim()
+    if ($p -match '^(?i)file:') {
+        $p = $p -replace '^(?i)file:/*', '\\'
+        try { $p = [Uri]::UnescapeDataString($p) } catch { }
+    }
+    $p = $p -replace '/', '\'
+    if ($p -notmatch '^\\\\([^\\]+)(?:\\([^\\]+))?(?:\\(.*))?$') { return $null }
+    $hostName = $Matches[1]
+    $share = $null
+    if ($Matches.Count -gt 2 -and $Matches[2]) { $share = $Matches[2] }
+    $rest = ''
+    if ($Matches.Count -gt 3 -and $Matches[3]) { $rest = $Matches[3].TrimEnd('\') }
+    if ($hostName -in @('?', '.')) { return $null }  # \\?\C:\ and \\.\ device paths
+    $root = "\\$hostName"
+    if ($share) { $root = "\\$hostName\$share" }
+    return @{ Host = $hostName; Share = $share; Rest = $rest; Root = $root }
+}
+
+function Get-WssQueryMachine {
+    <# Windows Search remote queries want the NetBIOS name; use the first label of FQDNs. #>
+    param([string]$HostName, [bool]$UseNetBios = $true)
+    if (-not $UseNetBios) { return $HostName }
+    if ($HostName -match '^\d{1,3}(\.\d{1,3}){3}$') { return $HostName }
+    if ($HostName -match '^\[?[0-9a-fA-F:]+\]?$' -and $HostName.Contains(':')) { return $HostName }
+    return ($HostName -split '\.')[0]
+}
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+function Get-WssMappedDrives {
+    <# Returns network drive mappings of the current user: @{ Drive='Z:'; Unc='\\srv\share' } #>
+    if ($script:DriveProvider) { return @(& $script:DriveProvider) }
+    if (-not (Test-WssIsWindows)) { return @() }
+
+    $map = [ordered]@{}
+    try {
+        $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=4' -ErrorAction Stop
+        foreach ($d in $disks) {
+            if ($d.ProviderName -and $d.DeviceID) { $map[$d.DeviceID.ToUpperInvariant()] = $d.ProviderName }
+        }
+    } catch {
+        Write-WssLog "CIM drive discovery failed: $($_.Exception.Message)"
+    }
+    # Persistent mappings (also covers drives that are currently disconnected)
+    try {
+        if (Test-Path 'HKCU:\Network') {
+            foreach ($k in Get-ChildItem 'HKCU:\Network' -ErrorAction Stop) {
+                $letter = ($k.PSChildName.ToUpperInvariant() + ':')
+                $remote = (Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction Stop).RemotePath
+                if ($remote -and -not $map.Contains($letter)) { $map[$letter] = $remote }
+            }
+        }
+    } catch {
+        Write-WssLog "Registry drive discovery failed: $($_.Exception.Message)"
+    }
+    # PSDrives (covers New-PSDrive -Persist / SMB mappings not visible to CIM in some sessions)
+    try {
+        foreach ($d in Get-PSDrive -PSProvider FileSystem -ErrorAction Stop) {
+            if ($d.DisplayRoot -and $d.DisplayRoot.StartsWith('\\')) {
+                $letter = ($d.Name.ToUpperInvariant() + ':')
+                if (-not $map.Contains($letter)) { $map[$letter] = $d.DisplayRoot }
+            }
+        }
+    } catch { }
+
+    $out = @()
+    foreach ($k in $map.Keys) { $out += @{ Drive = $k; Unc = $map[$k].TrimEnd('\') } }
+    return $out
+}
+
+function ConvertFrom-WssNetView {
+    <# Parses `net view \\server` output (any UI language) into share names. #>
+    param([string[]]$Lines)
+    $shares = @()
+    $inTable = $false
+    foreach ($line in $Lines) {
+        if ($line -match '^-{5,}') { $inTable = $true; continue }
+        if (-not $inTable) { continue }
+        if ($line.Trim() -eq '') { continue }
+        # Rows are fixed-width columns separated by 2+ spaces; the last line is a status message.
+        $name = ($line -split '\s{2,}')[0].Trim()
+        $cols = @($line -split '\s{2,}' | Where-Object { $_.Trim() })
+        if ($cols.Count -lt 2) { continue }   # status / footer line
+        if ($name.EndsWith('$')) { continue }
+        $shares += $name
+    }
+    return $shares
+}
+
+function Get-WssServerShares {
+    param([string]$HostName)
+    if ($script:ShareProvider) { return @(& $script:ShareProvider $HostName) }
+    if (-not (Test-WssIsWindows)) { return @() }
+    try {
+        $lines = & net.exe view "\\$HostName" 2>$null
+        $shares = @(ConvertFrom-WssNetView -Lines $lines)
+        # Disk shares only where the type column is recognisable; printers are excluded by Search anyway.
+        return $shares
+    } catch {
+        Write-WssLog "net view \\$HostName failed: $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Get-WssTargets {
+    <#
+      Builds the list of searchable servers:
+      @{ Name; Machine; Sources=@('mapped-drive','config'); Shares=@(@{ Name; Unc; Drives=@('Z:') }) }
+    #>
+    param([hashtable]$Config = (Get-WssConfig))
+
+    $servers = [ordered]@{}
+
+    $addShare = {
+        param([string]$Unc, [string]$Drive, [string]$Source)
+        $u = ConvertFrom-WssUncPath $Unc
+        if (-not $u) { return }
+        $key = $u.Host.ToLowerInvariant()
+        if (-not $servers.Contains($key)) {
+            $servers[$key] = @{
+                Name    = $u.Host
+                Machine = Get-WssQueryMachine $u.Host $Config.UseNetBios
+                Sources = New-Object System.Collections.ArrayList
+                Shares  = New-Object System.Collections.ArrayList
+            }
+        }
+        $srv = $servers[$key]
+        if (-not ($srv.Sources -contains $Source)) { [void]$srv.Sources.Add($Source) }
+        if (-not $u.Share) { return }
+        $unc = "\\$($u.Host)\$($u.Share)"
+        if ($u.Rest) { $unc = "$unc\$($u.Rest)" }
+        $existing = $null
+        foreach ($s in $srv.Shares) { if ($s.Unc -ieq $unc) { $existing = $s } }
+        if (-not $existing) {
+            $existing = @{ Name = $u.Share; Unc = $unc; Drives = New-Object System.Collections.ArrayList }
+            [void]$srv.Shares.Add($existing)
+        }
+        if ($Drive -and -not ($existing.Drives -contains $Drive)) { [void]$existing.Drives.Add($Drive) }
+    }
+
+    if ($Config.AutoDiscover) {
+        foreach ($d in Get-WssMappedDrives) { & $addShare $d.Unc $d.Drive 'mapped-drive' }
+    }
+    foreach ($s in $Config.Servers) {
+        $u = ConvertFrom-WssUncPath $s
+        if (-not $u) {
+            # Allow a bare host name ("fs01") as shorthand for \\fs01
+            if ($s -match '^[A-Za-z0-9._-]+$') { $u = ConvertFrom-WssUncPath "\\$s" } else {
+                Write-WssLog "Ignoring invalid server entry '$s' (expected \\server or \\server\share)"
+                continue
+            }
+        }
+        & $addShare $u.Root $null 'config'
+        if ($u.Rest -and $u.Share) { & $addShare "$($u.Root)\$($u.Rest)" $null 'config' }
+    }
+
+    # Servers configured without any share: enumerate shares with `net view`.
+    foreach ($srv in $servers.Values) {
+        if ($srv.Shares.Count -eq 0) {
+            foreach ($name in Get-WssServerShares $srv.Name) { & $addShare "\\$($srv.Name)\$name" $null 'net-view' }
+        }
+    }
+
+    $result = @()
+    foreach ($srv in $servers.Values) {
+        $excluded = $false
+        foreach ($x in $Config.Exclude) {
+            $xu = ConvertFrom-WssUncPath $x
+            if (($xu -and -not $xu.Share -and $xu.Host -ieq $srv.Name) -or ($x -ieq $srv.Name) -or ($x -ieq $srv.Machine)) { $excluded = $true }
+            if ($xu -and $xu.Share) {
+                $keep = New-Object System.Collections.ArrayList
+                foreach ($sh in $srv.Shares) { if (-not ($sh.Unc -ieq $xu.Root -or $sh.Unc -like "$($xu.Root)\*")) { [void]$keep.Add($sh) } }
+                $srv.Shares = $keep
+            }
+        }
+        if (-not $excluded) { $result += $srv }
+    }
+    return $result
+}
+
+# ---------------------------------------------------------------------------
+# Query building
+# ---------------------------------------------------------------------------
+
+function ConvertTo-WssSqlString {
+    <# Quotes a value as a Windows Search SQL string literal. #>
+    param([string]$Value)
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Get-WssQueryTerms {
+    <#
+      Tokenises a user query: words, "quoted phrases", -exclusions and OR.
+      Returns @{ Text; Phrase; Exclude; Or } items. Or=$true means "join with OR to the previous term".
+    #>
+    param([string]$Query)
+    $terms = @()
+    if (-not $Query) { return $terms }
+    $pendingOr = $false
+    $tokens = [regex]::Matches($Query, '(-?)"([^"]*)"|(\S+)')
+    foreach ($m in $tokens) {
+        $exclude = $false
+        $phrase = $false
+        if ($m.Groups[2].Success -and $m.Value.Contains('"')) {
+            $text = $m.Groups[2].Value
+            $phrase = $true
+            $exclude = ($m.Groups[1].Value -eq '-')
+        } else {
+            $text = $m.Groups[3].Value
+            if ($text -ceq 'OR' -or $text -eq '|') { $pendingOr = ($terms.Count -gt 0); continue }
+            if ($text -ceq 'AND') { continue }
+            if ($text.StartsWith('-') -and $text.Length -gt 1) { $exclude = $true; $text = $text.Substring(1) }
+        }
+        # Strip characters that would break the CONTAINS grammar.
+        $text = ($text -replace '["*()\[\]{}]', ' ').Trim()
+        $text = ($text -replace '\s+', ' ')
+        if (-not $text -or $text -notmatch '[\p{L}\p{N}]') { continue }
+        $terms += @{ Text = $text; Phrase = $phrase; Exclude = $exclude; Or = ($pendingOr -and -not $exclude) }
+        $pendingOr = $false
+    }
+    return $terms
+}
+
+function Get-WssTermCondition {
+    param([hashtable]$Term, [string]$Match)
+    $text = $Term.Text
+    $isPhrase = $Term.Phrase -or $text.Contains(' ')
+    if ($isPhrase) { $containsArg = '"' + $text + '"' } else { $containsArg = '"' + $text + '*"' }
+    $contains = 'CONTAINS(*, ' + (ConvertTo-WssSqlString $containsArg) + ')'
+    $likeValue = '%' + ($text -replace '([\[%_])', '[$1]') + '%'
+    $like = 'System.FileName LIKE ' + (ConvertTo-WssSqlString $likeValue)
+    switch ($Match) {
+        'filename' { return $like }
+        'contents' { return $contains }
+        default { return "($contains OR $like)" }
+    }
+}
+
+function Format-WssSqlDate {
+    param([string]$Value, [string]$ParamName)
+    $dt = [DateTime]::MinValue
+    $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
+    if (-not [DateTime]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$dt)) {
+        throw "Invalid date for ${ParamName}: '$Value' (use ISO 8601, e.g. 2024-05-31 or 2024-05-31T12:00:00Z)"
+    }
+    return "'" + $dt.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + "'"
+}
+
+function New-WssSearchSql {
+    <# Builds a Windows Search SQL statement for one server and a set of scopes. #>
+    param(
+        [Parameter(Mandatory)][string]$Machine,
+        [string[]]$Scopes = @(),
+        [string]$Query,
+        [ValidateSet('all', 'filename', 'contents')][string]$Match = 'all',
+        [string[]]$Extensions = @(),
+        [string]$Kind,
+        [string]$Author,
+        [string]$ModifiedAfter,
+        [string]$ModifiedBefore,
+        [bool]$IncludeFolders = $false,
+        [ValidateSet('relevance', 'modified', 'name', 'size')][string]$Sort = 'relevance',
+        [int]$Top = 50
+    )
+    $where = New-Object System.Collections.ArrayList
+
+    if ($Scopes.Count -gt 0) {
+        $scopeConds = @()
+        foreach ($s in $Scopes) {
+            $u = ConvertFrom-WssUncPath $s
+            if (-not $u) { throw "Scope '$s' is not a UNC path" }
+            $url = "file://$($u.Host)"
+            if ($u.Share) { $url += "/$($u.Share)" }
+            if ($u.Rest) { $url += '/' + ($u.Rest -replace '\\', '/') }
+            $scopeConds += 'SCOPE=' + (ConvertTo-WssSqlString $url)
+        }
+        if ($scopeConds.Count -eq 1) { [void]$where.Add($scopeConds[0]) } else { [void]$where.Add('(' + ($scopeConds -join ' OR ') + ')') }
+    }
+
+    $terms = @(Get-WssQueryTerms $Query)
+    $hasText = $false
+    if ($terms.Count -gt 0) {
+        $expr = ''
+        foreach ($t in $terms) {
+            $cond = Get-WssTermCondition $t $Match
+            if ($t.Exclude) { $cond = "NOT $cond" } else { $hasText = $true }
+            if ($expr -eq '') { $expr = $cond }
+            elseif ($t.Or) { $expr = "($expr OR $cond)" }
+            else { $expr = "$expr AND $cond" }
+        }
+        [void]$where.Add("($expr)")
+    }
+
+    if ($Extensions -and $Extensions.Count -gt 0) {
+        $extConds = @()
+        foreach ($e in $Extensions) {
+            $x = "$e".Trim().ToLowerInvariant()
+            if (-not $x) { continue }
+            if ($x -match '[^a-z0-9._+-]') { throw "Invalid file extension '$e'" }
+            if (-not $x.StartsWith('.')) { $x = ".$x" }
+            $extConds += 'System.FileExtension = ' + (ConvertTo-WssSqlString $x)
+        }
+        if ($extConds.Count -gt 0) { [void]$where.Add('(' + ($extConds -join ' OR ') + ')') }
+    }
+    if ($Kind) {
+        if ($Kind -notmatch '^[A-Za-z]+$') { throw "Invalid kind '$Kind'" }
+        [void]$where.Add('System.Kind = ' + (ConvertTo-WssSqlString $Kind.ToLowerInvariant()))
+    }
+    if ($Author) { [void]$where.Add('System.Author = ' + (ConvertTo-WssSqlString $Author)) }
+    if ($ModifiedAfter) { [void]$where.Add('System.DateModified >= ' + (Format-WssSqlDate $ModifiedAfter 'modified_after')) }
+    if ($ModifiedBefore) { [void]$where.Add('System.DateModified <= ' + (Format-WssSqlDate $ModifiedBefore 'modified_before')) }
+    if (-not $IncludeFolders) { [void]$where.Add("System.ItemType <> 'Directory'") }
+
+    switch ($Sort) {
+        'modified' { $order = 'System.DateModified DESC' }
+        'name' { $order = 'System.FileName ASC' }
+        'size' { $order = 'System.Size DESC' }
+        default { if ($hasText) { $order = 'System.Search.Rank DESC' } else { $order = 'System.DateModified DESC' } }
+    }
+
+    if ($Machine -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid server name '$Machine'" }
+    $sql = "SELECT TOP $Top " + ($script:ResultColumns -join ', ') + " FROM $Machine.SystemIndex"
+    if ($where.Count -gt 0) { $sql += ' WHERE ' + ($where -join ' AND ') }
+    $sql += " ORDER BY $order"
+    return $sql
+}
+
+# ---------------------------------------------------------------------------
+# Query execution
+# ---------------------------------------------------------------------------
+
+function Invoke-WssQuery {
+    <# Executes Windows Search SQL via the Search.CollatorDSO OLE DB provider (ADODB COM). #>
+    param([string]$Machine, [string]$Sql, [int]$TimeoutSeconds = 30)
+    if ($script:QueryExecutor) { return @(& $script:QueryExecutor $Machine $Sql $TimeoutSeconds) }
+    if (-not (Test-WssIsWindows)) { throw 'Windows Search queries are only supported on Windows.' }
+
+    $conn = New-Object -ComObject ADODB.Connection
+    $rs = $null
+    try {
+        $conn.ConnectionTimeout = $TimeoutSeconds
+        $conn.CommandTimeout = $TimeoutSeconds
+        $conn.Open("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';")
+        $rs = New-Object -ComObject ADODB.Recordset
+        $rs.Open($Sql, $conn)
+        $rows = New-Object System.Collections.ArrayList
+        while (-not $rs.EOF) {
+            $row = @{}
+            foreach ($f in $rs.Fields) { $row[$f.Name] = $f.Value }
+            [void]$rows.Add($row)
+            $rs.MoveNext()
+        }
+        return , $rows.ToArray()
+    } finally {
+        if ($rs) { try { if ($rs.State -ne 0) { $rs.Close() } } catch { }; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($rs) }
+        try { if ($conn.State -ne 0) { $conn.Close() } } catch { }
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($conn)
+    }
+}
+
+function ConvertTo-WssIso {
+    param($Value)
+    if ($null -eq $Value -or $Value -is [DBNull]) { return $null }
+    if ($Value -is [DateTime]) { return $Value.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture) }
+    return "$Value"
+}
+
+function ConvertTo-WssPlain {
+    param($Value)
+    if ($null -eq $Value -or $Value -is [DBNull]) { return $null }
+    if ($Value -is [DateTime]) { return ConvertTo-WssIso $Value }
+    if ($Value -is [array]) { return @($Value | ForEach-Object { "$_" }) }
+    return $Value
+}
+
+function Get-WssRowValue {
+    param([hashtable]$Row, [string]$Name)
+    foreach ($k in $Row.Keys) { if ($k -ieq $Name) { return $Row[$k] } }
+    return $null
+}
+
+function Convert-WssUncToDrivePath {
+    param([string]$Unc, $Targets)
+    foreach ($srv in $Targets) {
+        foreach ($sh in $srv.Shares) {
+            if ($sh.Drives.Count -eq 0) { continue }
+            foreach ($root in @($sh.Unc, ("\\" + $srv.Machine + $sh.Unc.Substring(2 + $srv.Name.Length)))) {
+                if ($Unc -ieq $root) { return $sh.Drives[0] + '\' }
+                if ($Unc.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    return $sh.Drives[0] + $Unc.Substring($root.Length)
+                }
+            }
+        }
+    }
+    return $null
+}
+
+function ConvertTo-WssResult {
+    param([hashtable]$Row, [string]$ServerName, $Targets)
+    $url = Get-WssRowValue $Row 'System.ItemUrl'
+    $display = Get-WssRowValue $Row 'System.ItemPathDisplay'
+    $unc = $null
+    if ($url -and "$url" -match '^(?i)file:') {
+        $u = ConvertFrom-WssUncPath "$url"
+        if ($u) { $unc = $u.Root; if ($u.Rest) { $unc += '\' + $u.Rest } }
+    }
+    if (-not $unc -and $display) { $unc = "$display" }
+    $result = [ordered]@{
+        name     = ConvertTo-WssPlain (Get-WssRowValue $Row 'System.FileName')
+        path     = $unc
+        server   = $ServerName
+    }
+    if ($unc) {
+        $drivePath = Convert-WssUncToDrivePath $unc $Targets
+        if ($drivePath) { $result.drive_path = $drivePath }
+    }
+    $type = ConvertTo-WssPlain (Get-WssRowValue $Row 'System.ItemTypeText')
+    if ($type) { $result.type = $type }
+    $size = Get-WssRowValue $Row 'System.Size'
+    if ($null -ne $size -and -not ($size -is [DBNull])) { $result.size = [int64]$size }
+    $modified = ConvertTo-WssIso (Get-WssRowValue $Row 'System.DateModified')
+    if ($modified) { $result.modified = $modified }
+    $created = ConvertTo-WssIso (Get-WssRowValue $Row 'System.DateCreated')
+    if ($created) { $result.created = $created }
+    $title = ConvertTo-WssPlain (Get-WssRowValue $Row 'System.Title')
+    if ($title) { $result.title = $title }
+    $author = ConvertTo-WssPlain (Get-WssRowValue $Row 'System.Author')
+    if ($author) { $result.author = @($author) }
+    $kind = ConvertTo-WssPlain (Get-WssRowValue $Row 'System.Kind')
+    if ($kind) { $result.kind = @($kind) }
+    $rank = Get-WssRowValue $Row 'System.Search.Rank'
+    if ($null -ne $rank -and -not ($rank -is [DBNull])) { $result.rank = [int64]$rank }
+    return $result
+}
+
+function Get-WssErrorMessage {
+    param($ErrorRecord, [string]$Machine)
+    $msg = $ErrorRecord.Exception.Message
+    $hint = ''
+    if ($msg -match '0x80040E37|0x80070005|0x800706BA|0x80070035|0x80040154|Remote|RPC|not found|nicht gefunden') {
+        $hint = " Hint: remote index queries require the 'Windows Search Service' on '$Machine' to be installed/running and to index the shared folder, and the share must be reachable by its NetBIOS name."
+    }
+    return "$msg$hint"
+}
+
+function Select-WssTargets {
+    <# Applies the optional server / path filters. Returns @{ Server; Scopes } pairs. #>
+    param($Targets, [string]$Server, [string]$Path)
+    $plans = @()
+    $pathUnc = $null
+    if ($Path) {
+        $pathUnc = Resolve-WssPath $Path $Targets -AllowAnyShareOfKnownServer
+    }
+    foreach ($srv in $Targets) {
+        if ($Server -and -not ($srv.Name -ieq $Server -or $srv.Machine -ieq $Server)) { continue }
+        if ($pathUnc) {
+            $u = ConvertFrom-WssUncPath $pathUnc
+            if (-not ($u.Host -ieq $srv.Name -or $u.Host -ieq $srv.Machine)) { continue }
+            $plans += @{ Server = $srv; Scopes = @("\\$($srv.Machine)\$($u.Share)" + $(if ($u.Rest) { "\$($u.Rest)" } else { '' })) }
+            continue
+        }
+        $scopes = @()
+        foreach ($sh in $srv.Shares) { $scopes += ("\\" + $srv.Machine + $sh.Unc.Substring(2 + $srv.Name.Length)) }
+        $plans += @{ Server = $srv; Scopes = $scopes }
+    }
+    return $plans
+}
+
+function Search-Wss {
+    param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig), $Targets = $null)
+    if ($null -eq $Targets) { $Targets = @(Get-WssTargets -Config $Config) }
+    if ($Targets.Count -eq 0) {
+        throw 'No Windows servers configured or discovered. Map a network drive (e.g. net use Z: \\server\share) or set the "servers" plugin option.'
+    }
+    $limit = ConvertTo-WssInt $Arguments.max_results $Config.MaxResults 1 500
+    $match = 'all'; if ($Arguments.match) { $match = "$($Arguments.match)".ToLowerInvariant() }
+    $sort = 'relevance'; if ($Arguments.sort) { $sort = "$($Arguments.sort)".ToLowerInvariant() }
+    $exts = @(); if ($Arguments.extensions) { $exts = @($Arguments.extensions) }
+    if ($match -notin @('all', 'filename', 'contents')) { throw "Invalid match '$match' (use all, filename or contents)" }
+    if ($sort -notin @('relevance', 'modified', 'name', 'size')) { throw "Invalid sort '$sort' (use relevance, modified, name or size)" }
+
+    if (-not $Arguments.query -and $exts.Count -eq 0 -and -not $Arguments.kind -and -not $Arguments.modified_after -and -not $Arguments.modified_before -and -not $Arguments.author) {
+        throw 'Provide a query or at least one filter (extensions, kind, author, modified_after, modified_before).'
+    }
+
+    $plans = @(Select-WssTargets $Targets $Arguments.server $Arguments.path)
+    if ($plans.Count -eq 0) {
+        $names = ($Targets | ForEach-Object { $_.Name }) -join ', '
+        throw "No matching server for server='$($Arguments.server)' path='$($Arguments.path)'. Known servers: $names"
+    }
+
+    $results = New-Object System.Collections.ArrayList
+    $errors = New-Object System.Collections.ArrayList
+    $queried = @()
+    foreach ($plan in $plans) {
+        $srv = $plan.Server
+        $queried += $srv.Name
+        try {
+            $sql = New-WssSearchSql -Machine $srv.Machine -Scopes $plan.Scopes -Query $Arguments.query -Match $match `
+                -Extensions $exts -Kind $Arguments.kind -Author $Arguments.author `
+                -ModifiedAfter $Arguments.modified_after -ModifiedBefore $Arguments.modified_before `
+                -IncludeFolders (ConvertTo-WssBool $Arguments.include_folders $false) -Sort $sort -Top $limit
+            Write-WssLog "Query [$($srv.Machine)]: $sql"
+            $rows = @(Invoke-WssQuery -Machine $srv.Machine -Sql $sql -TimeoutSeconds $Config.QueryTimeout)
+            foreach ($r in $rows) { [void]$results.Add((ConvertTo-WssResult $r $srv.Name $Targets)) }
+        } catch {
+            if ($_.Exception.Message -match '^Invalid ') { throw }
+            [void]$errors.Add([ordered]@{ server = $srv.Name; error = (Get-WssErrorMessage $_ $srv.Machine) })
+        }
+    }
+
+    $sorted = @($results)
+    if ($plans.Count -gt 1) {
+        switch ($sort) {
+            'modified' { $sorted = @($results | Sort-Object -Property @{ Expression = { $_.modified }; Descending = $true }) }
+            'name' { $sorted = @($results | Sort-Object -Property @{ Expression = { $_.name } }) }
+            'size' { $sorted = @($results | Sort-Object -Property @{ Expression = { $_.size }; Descending = $true }) }
+            default {
+                $sorted = @($results | Sort-Object -Property @{ Expression = { if ($_.Contains('rank')) { $_.rank } else { 0 } }; Descending = $true }, @{ Expression = { $_.modified }; Descending = $true })
+            }
+        }
+    }
+    if ($sorted.Count -gt $limit) { $sorted = $sorted[0..($limit - 1)] }
+
+    $out = [ordered]@{
+        servers_queried = @($queried)
+        result_count    = $sorted.Count
+        results         = @($sorted)
+    }
+    if ($errors.Count -gt 0) { $out.errors = @($errors) }
+    if ($errors.Count -eq $plans.Count -and $plans.Count -gt 0) {
+        throw ('All index queries failed: ' + (($errors | ForEach-Object { "$($_.server): $($_.error)" }) -join ' | '))
+    }
+    return $out
+}
+
+function Test-WssServer {
+    param($Server, [hashtable]$Config)
+    $scopes = @()
+    foreach ($sh in $Server.Shares) { $scopes += ("\\" + $Server.Machine + $sh.Unc.Substring(2 + $Server.Name.Length)) }
+    $sql = "SELECT TOP 1 System.ItemUrl FROM $($Server.Machine).SystemIndex"
+    if ($scopes.Count -gt 0) {
+        $conds = @()
+        foreach ($s in $scopes) {
+            $u = ConvertFrom-WssUncPath $s
+            $url = "file://$($u.Host)/$($u.Share)"
+            if ($u.Rest) { $url += '/' + ($u.Rest -replace '\\', '/') }
+            $conds += 'SCOPE=' + (ConvertTo-WssSqlString $url)
+        }
+        $sql += ' WHERE ' + ($conds -join ' OR ')
+    }
+    try {
+        $rows = @(Invoke-WssQuery -Machine $Server.Machine -Sql $sql -TimeoutSeconds $Config.QueryTimeout)
+        if ($rows.Count -gt 0) { return [ordered]@{ status = 'ok'; detail = 'Index reachable and returned results.' } }
+        return [ordered]@{ status = 'empty'; detail = 'Index reachable but returned no items for these shares (folder may not be indexed on the server).' }
+    } catch {
+        return [ordered]@{ status = 'error'; detail = (Get-WssErrorMessage $_ $Server.Machine) }
+    }
+}
+
+function Get-WssServerList {
+    param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig))
+    $targets = @(Get-WssTargets -Config $Config)
+    $check = ConvertTo-WssBool $Arguments.check $false
+    $list = @()
+    foreach ($srv in $targets) {
+        $shares = @()
+        foreach ($sh in $srv.Shares) {
+            $shares += [ordered]@{ name = $sh.Name; path = $sh.Unc; drives = @($sh.Drives) }
+        }
+        $entry = [ordered]@{
+            name           = $srv.Name
+            query_machine  = $srv.Machine
+            sources        = @($srv.Sources)
+            shares         = @($shares)
+        }
+        if ($check) { $entry.index = Test-WssServer $srv $Config }
+        $list += $entry
+    }
+    $out = [ordered]@{
+        servers = @($list)
+        config  = [ordered]@{
+            auto_discover    = $Config.AutoDiscover
+            configured       = @($Config.Servers)
+            excluded         = @($Config.Exclude)
+            max_results      = $Config.MaxResults
+        }
+    }
+    if ($list.Count -eq 0) {
+        $out.hint = 'No servers found. Map a network drive to a Windows file server (net use Z: \\server\share) or configure the "servers" option of the plugin with UNC paths like \\server\share.'
+    }
+    return $out
+}
+
+# ---------------------------------------------------------------------------
+# File access (restricted to known shares)
+# ---------------------------------------------------------------------------
+
+function Resolve-WssPath {
+    <#
+      Converts a drive path (Z:\x) or UNC path into a normalized UNC path and checks that it lies
+      within a known share. Throws otherwise.
+    #>
+    param([string]$Path, $Targets, [switch]$AllowAnyShareOfKnownServer)
+    if (-not $Path) { throw 'path is required' }
+    $p = $Path.Trim() -replace '/', '\'
+    if ($p -match '^([A-Za-z]:)(\\.*)?$') {
+        $drive = $Matches[1].ToUpperInvariant()
+        $rest = ''; if ($Matches.Count -gt 2 -and $Matches[2]) { $rest = $Matches[2] }
+        $found = $null
+        foreach ($srv in $Targets) { foreach ($sh in $srv.Shares) { if ($sh.Drives -contains $drive) { $found = $sh.Unc } } }
+        if (-not $found) { throw "Drive $drive is not a mapped drive of a known Windows server." }
+        $p = $found + $rest
+    }
+    if ($p -match '^(?i)file:') { $p = (ConvertFrom-WssUncPath $p).Root + $(if ((ConvertFrom-WssUncPath $p).Rest) { '\' + (ConvertFrom-WssUncPath $p).Rest } else { '' }) }
+    $u = ConvertFrom-WssUncPath $p
+    if (-not $u -or -not $u.Share) { throw "Path '$Path' is not a UNC path (\\server\share\...) or mapped drive path." }
+    # Normalise . and .. segments to prevent escaping the share.
+    $segments = New-Object System.Collections.ArrayList
+    foreach ($seg in ($u.Rest -split '\\')) {
+        if ($seg -eq '' -or $seg -eq '.') { continue }
+        if ($seg -eq '..') { if ($segments.Count -gt 0) { $segments.RemoveAt($segments.Count - 1) }; continue }
+        [void]$segments.Add($seg)
+    }
+    $norm = "\\$($u.Host)\$($u.Share)"
+    if ($segments.Count -gt 0) { $norm += '\' + ($segments -join '\') }
+
+    foreach ($srv in $Targets) {
+        if (-not ($u.Host -ieq $srv.Name -or $u.Host -ieq $srv.Machine)) { continue }
+        if ($AllowAnyShareOfKnownServer) { return $norm }
+        foreach ($sh in $srv.Shares) {
+            $root = "\\$($u.Host)" + $sh.Unc.Substring(2 + $srv.Name.Length)
+            if ($norm -ieq $root -or $norm.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return $norm }
+        }
+    }
+    throw "Path '$Path' is outside the known Windows server shares. Use list_servers to see available shares."
+}
+
+function ConvertFrom-WssXmlText {
+    param([string]$Xml, [string]$ParagraphTag, [string]$TextTag)
+    $s = $Xml
+    if ($ParagraphTag) { $s = $s -replace "</$ParagraphTag>", "`n" }
+    $s = $s -replace '<w:tab/>', "`t" -replace '<w:br/>', "`n"
+    $s = $s -replace '<[^>]+>', ''
+    return [System.Net.WebUtility]::HtmlDecode($s)
+}
+
+function Get-WssZipEntryText {
+    param($Zip, [string]$Name)
+    $e = $Zip.GetEntry($Name)
+    if (-not $e) { return $null }
+    $sr = New-Object IO.StreamReader($e.Open(), [Text.Encoding]::UTF8)
+    try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+}
+
+function Get-WssDocumentText {
+    <# Extracts readable text from plain-text files and Office Open XML documents. #>
+    param([string]$LiteralPath)
+    $ext = [IO.Path]::GetExtension($LiteralPath).ToLowerInvariant()
+    if ($ext -in @('.docx', '.docm', '.pptx', '.pptm', '.xlsx', '.xlsm')) {
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $fs = [IO.File]::Open($LiteralPath, 'Open', 'Read', 'ReadWrite')
+        $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Read)
+        try {
+            if ($ext -like '.doc*') {
+                return (ConvertFrom-WssXmlText (Get-WssZipEntryText $zip 'word/document.xml') 'w:p').Trim()
+            }
+            if ($ext -like '.ppt*') {
+                $slides = @($zip.Entries | Where-Object { $_.FullName -match '^ppt/slides/slide(\d+)\.xml$' } |
+                    Sort-Object { [int]([regex]::Match($_.FullName, '(\d+)\.xml$').Groups[1].Value) })
+                $sb = New-Object Text.StringBuilder
+                $i = 0
+                foreach ($s in $slides) {
+                    $i++
+                    [void]$sb.AppendLine("--- Slide $i ---")
+                    [void]$sb.AppendLine((ConvertFrom-WssXmlText (Get-WssZipEntryText $zip $s.FullName) 'a:p').Trim())
+                }
+                return $sb.ToString().Trim()
+            }
+            # xlsx: resolve shared strings, emit one tab-separated line per row
+            $shared = @()
+            $ssXml = Get-WssZipEntryText $zip 'xl/sharedStrings.xml'
+            if ($ssXml) {
+                foreach ($m in [regex]::Matches($ssXml, '<si>(.*?)</si>', 'Singleline')) {
+                    $shared += [System.Net.WebUtility]::HtmlDecode(($m.Groups[1].Value -replace '<rPh.*?</rPh>', '' -replace '<[^>]+>', ''))
+                }
+            }
+            $sheets = @($zip.Entries | Where-Object { $_.FullName -match '^xl/worksheets/sheet(\d+)\.xml$' } |
+                Sort-Object { [int]([regex]::Match($_.FullName, '(\d+)\.xml$').Groups[1].Value) })
+            $sb = New-Object Text.StringBuilder
+            foreach ($sheet in $sheets) {
+                [void]$sb.AppendLine("--- $([IO.Path]::GetFileNameWithoutExtension($sheet.FullName)) ---")
+                $xml = Get-WssZipEntryText $zip $sheet.FullName
+                foreach ($row in [regex]::Matches($xml, '<row[^>]*>(.*?)</row>', 'Singleline')) {
+                    $cells = @()
+                    foreach ($c in [regex]::Matches($row.Groups[1].Value, '<c([^>]*?)(?:/>|>(.*?)</c>)', 'Singleline')) {
+                        $attrs = $c.Groups[1].Value
+                        $inner = $c.Groups[2].Value
+                        $v = [regex]::Match($inner, '<v>(.*?)</v>', 'Singleline').Groups[1].Value
+                        if ($attrs -match 't="s"' -and $v -match '^\d+$' -and [int]$v -lt $shared.Count) { $v = $shared[[int]$v] }
+                        elseif ($attrs -match 't="inlineStr"') { $v = ($inner -replace '<[^>]+>', '') }
+                        $cells += [System.Net.WebUtility]::HtmlDecode($v)
+                    }
+                    [void]$sb.AppendLine(($cells -join "`t"))
+                }
+            }
+            return $sb.ToString().Trim()
+        } finally {
+            $zip.Dispose(); $fs.Dispose()
+        }
+    }
+    $bytes = [IO.File]::ReadAllBytes($LiteralPath)
+    $probe = [Math]::Min($bytes.Length, 8000)
+    for ($i = 0; $i -lt $probe; $i++) {
+        if ($bytes[$i] -eq 0) {
+            # UTF-16 files contain NULs too; detect by BOM.
+            if ($bytes.Length -ge 2 -and (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF))) { break }
+            throw "'$LiteralPath' looks like a binary file ($ext). Only text files and .docx/.xlsx/.pptx can be read."
+        }
+    }
+    $sr = New-Object IO.StreamReader((New-Object IO.MemoryStream(, $bytes)), (New-Object Text.UTF8Encoding($false)), $true)
+    try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+}
+
+function Read-WssFile {
+    param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig), $Targets = $null)
+    if ($null -eq $Targets) { $Targets = @(Get-WssTargets -Config $Config) }
+    $unc = Resolve-WssPath $Arguments.path $Targets
+    if (-not (Test-Path -LiteralPath $unc -PathType Leaf)) { throw "File not found: $unc" }
+    $item = Get-Item -LiteralPath $unc
+    $maxBytes = 50MB
+    if ($item.Length -gt $maxBytes) { throw "File is too large to read ($($item.Length) bytes)." }
+    $text = Get-WssDocumentText -LiteralPath $unc
+    $offset = ConvertTo-WssInt $Arguments.offset 0 0 ([int]::MaxValue)
+    $max = ConvertTo-WssInt $Arguments.max_chars 20000 1 200000
+    $total = $text.Length
+    if ($offset -gt $total) { $offset = $total }
+    $len = [Math]::Min($max, $total - $offset)
+    $chunk = $text.Substring($offset, $len)
+    $out = [ordered]@{
+        path          = $unc
+        size_bytes    = [int64]$item.Length
+        modified      = ConvertTo-WssIso $item.LastWriteTime
+        total_chars   = $total
+        offset        = $offset
+        returned      = $len
+        truncated     = (($offset + $len) -lt $total)
+    }
+    $drivePath = Convert-WssUncToDrivePath $unc $Targets
+    if ($drivePath) { $out.drive_path = $drivePath }
+    if ($out.truncated) { $out.next_offset = $offset + $len }
+    $out.content = $chunk
+    return $out
+}
+
+function Get-WssDirectoryListing {
+    param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig), $Targets = $null)
+    if ($null -eq $Targets) { $Targets = @(Get-WssTargets -Config $Config) }
+    $unc = Resolve-WssPath $Arguments.path $Targets
+    if (-not (Test-Path -LiteralPath $unc -PathType Container)) { throw "Directory not found: $unc" }
+    $limit = ConvertTo-WssInt $Arguments.max_entries 200 1 2000
+    $entries = @()
+    $count = 0
+    $truncated = $false
+    foreach ($i in Get-ChildItem -LiteralPath $unc -Force -ErrorAction SilentlyContinue) {
+        if ($count -ge $limit) { $truncated = $true; break }
+        $count++
+        $e = [ordered]@{ name = $i.Name; type = $(if ($i.PSIsContainer) { 'directory' } else { 'file' }) }
+        if (-not $i.PSIsContainer) { $e.size = [int64]$i.Length }
+        $e.modified = ConvertTo-WssIso $i.LastWriteTime
+        $entries += $e
+    }
+    $out = [ordered]@{ path = $unc }
+    $drivePath = Convert-WssUncToDrivePath $unc $Targets
+    if ($drivePath) { $out.drive_path = $drivePath }
+    $out.entries = @($entries)
+    $out.truncated = $truncated
+    return $out
+}
+
+# ---------------------------------------------------------------------------
+# MCP protocol
+# ---------------------------------------------------------------------------
+
+function Get-WssToolDefinitions {
+    $serverProp = @{ type = 'string'; description = 'Restrict to one server (name as returned by list_servers). Default: all servers.' }
+    return @(
+        [ordered]@{
+            name        = 'list_servers'
+            title       = 'List Windows servers'
+            description = 'Lists the Windows file servers and shares available for searching (auto-discovered from mapped network drives and/or configured), including their drive letters. Set check=true to test whether each server''s search index is reachable.'
+            inputSchema = [ordered]@{
+                type       = 'object'
+                properties = [ordered]@{
+                    check = @{ type = 'boolean'; description = 'Run a test query against each server''s Windows Search index.'; default = $false }
+                }
+            }
+            annotations = @{ readOnlyHint = $true; openWorldHint = $false }
+        },
+        [ordered]@{
+            name        = 'search_files'
+            title       = 'Search Windows server index'
+            description = 'Searches the Windows Search index of the Windows file server(s) for files by content and/or file name, with optional filters. Results include UNC path, mapped drive path, size, dates, author and relevance rank. Query syntax: words are ANDed (prefix match), "exact phrase", -exclude, OR between terms.'
+            inputSchema = [ordered]@{
+                type       = 'object'
+                properties = [ordered]@{
+                    query           = @{ type = 'string'; description = 'Search terms, e.g. budget 2024 "project alpha" -draft' }
+                    match           = @{ type = 'string'; enum = @('all', 'filename', 'contents'); default = 'all'; description = 'Match terms against file contents+properties+name (all), only file name, or only indexed contents/properties.' }
+                    server          = $serverProp
+                    path            = @{ type = 'string'; description = 'Restrict to a folder: UNC path (\\server\share\folder) or mapped drive path (Z:\folder).' }
+                    extensions      = @{ type = 'array'; items = @{ type = 'string' }; description = 'File extensions to include, e.g. ["pdf","docx"].' }
+                    kind            = @{ type = 'string'; description = 'Windows kind filter, e.g. document, picture, music, video, email, folder, program.' }
+                    author          = @{ type = 'string'; description = 'Exact document author.' }
+                    modified_after  = @{ type = 'string'; description = 'ISO date/time (UTC), e.g. 2024-01-01' }
+                    modified_before = @{ type = 'string'; description = 'ISO date/time (UTC), e.g. 2024-12-31T23:59:59Z' }
+                    include_folders = @{ type = 'boolean'; default = $false; description = 'Also return folders.' }
+                    sort            = @{ type = 'string'; enum = @('relevance', 'modified', 'name', 'size'); default = 'relevance' }
+                    max_results     = @{ type = 'integer'; minimum = 1; maximum = 500; description = 'Maximum results (default from configuration, 50).' }
+                }
+            }
+            annotations = @{ readOnlyHint = $true; openWorldHint = $false }
+        },
+        [ordered]@{
+            name        = 'read_file'
+            title       = 'Read file from Windows server'
+            description = 'Reads the text content of a file on a known Windows server share (UNC or mapped drive path). Supports plain-text formats and .docx/.xlsx/.pptx. Long files are returned in chunks; use offset/next_offset to continue.'
+            inputSchema = [ordered]@{
+                type       = 'object'
+                properties = [ordered]@{
+                    path      = @{ type = 'string'; description = 'UNC path (\\server\share\dir\file.txt) or mapped drive path (Z:\dir\file.txt).' }
+                    offset    = @{ type = 'integer'; minimum = 0; default = 0; description = 'Character offset to start reading from.' }
+                    max_chars = @{ type = 'integer'; minimum = 1; maximum = 200000; default = 20000; description = 'Maximum characters to return.' }
+                }
+                required   = @('path')
+            }
+            annotations = @{ readOnlyHint = $true; openWorldHint = $false }
+        },
+        [ordered]@{
+            name        = 'list_directory'
+            title       = 'List folder on Windows server'
+            description = 'Lists files and sub-folders of a folder on a known Windows server share (UNC or mapped drive path).'
+            inputSchema = [ordered]@{
+                type       = 'object'
+                properties = [ordered]@{
+                    path        = @{ type = 'string'; description = 'UNC path (\\server\share\dir) or mapped drive path (Z:\dir).' }
+                    max_entries = @{ type = 'integer'; minimum = 1; maximum = 2000; default = 200 }
+                }
+                required   = @('path')
+            }
+            annotations = @{ readOnlyHint = $true; openWorldHint = $false }
+        }
+    )
+}
+
+function ConvertTo-WssHashtable {
+    <# Converts PSCustomObject (from ConvertFrom-Json) into nested hashtables/arrays. #>
+    param($InputObject)
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $h = @{}
+        foreach ($p in $InputObject.PSObject.Properties) { $h[$p.Name] = ConvertTo-WssHashtable $p.Value }
+        return $h
+    }
+    if ($InputObject -is [array]) {
+        $a = @()
+        foreach ($i in $InputObject) { $a += , (ConvertTo-WssHashtable $i) }
+        return , $a
+    }
+    return $InputObject
+}
+
+function ConvertTo-WssJson {
+    param($Object)
+    return (ConvertTo-Json -InputObject $Object -Depth 30 -Compress)
+}
+
+function Invoke-WssTool {
+    param([string]$Name, [hashtable]$Arguments)
+    if ($null -eq $Arguments) { $Arguments = @{} }
+    switch ($Name) {
+        'list_servers' { return Get-WssServerList -Arguments $Arguments }
+        'search_files' { return Search-Wss -Arguments $Arguments }
+        'read_file' { return Read-WssFile -Arguments $Arguments }
+        'list_directory' { return Get-WssDirectoryListing -Arguments $Arguments }
+        default { throw [System.Collections.Generic.KeyNotFoundException]::new("Unknown tool: $Name") }
+    }
+}
+
+function New-WssResponse {
+    param($Id, $Result)
+    return [ordered]@{ jsonrpc = '2.0'; id = $Id; result = $Result }
+}
+
+function New-WssError {
+    param($Id, [int]$Code, [string]$Message)
+    return [ordered]@{ jsonrpc = '2.0'; id = $Id; error = [ordered]@{ code = $Code; message = $Message } }
+}
+
+function Invoke-WssRequest {
+    <# Handles one JSON-RPC message (hashtable). Returns a response object or $null for notifications. #>
+    param([hashtable]$Message)
+    $hasId = $Message.ContainsKey('id')
+    $id = $null; if ($hasId) { $id = $Message.id }
+    $method = $Message.method
+    $params = $Message.params
+    if ($null -eq $params) { $params = @{} }
+
+    if (-not $method) {
+        if ($hasId) { return New-WssError $id -32600 'Invalid Request' }
+        return $null
+    }
+    if (-not $hasId) { return $null }  # notifications (initialized, cancelled, ...)
+
+    switch ($method) {
+        'initialize' {
+            $requested = "$($params.protocolVersion)"
+            $version = $script:SupportedProtocolVersions[0]
+            if ($script:SupportedProtocolVersions -contains $requested) { $version = $requested }
+            return New-WssResponse $id ([ordered]@{
+                    protocolVersion = $version
+                    capabilities    = [ordered]@{ tools = [ordered]@{ listChanged = $false } }
+                    serverInfo      = [ordered]@{ name = $script:ServerName; title = 'Windows Server Search'; version = $script:ServerVersion }
+                    instructions    = 'Search files on Windows file servers through their Windows Search index. Call list_servers first to see available servers/shares, then search_files; use read_file to read results.'
+                })
+        }
+        'ping' { return New-WssResponse $id @{} }
+        'tools/list' { return New-WssResponse $id ([ordered]@{ tools = @(Get-WssToolDefinitions) }) }
+        'tools/call' {
+            $name = $params.name
+            $known = @(Get-WssToolDefinitions | ForEach-Object { $_.name })
+            if ($known -notcontains $name) { return New-WssError $id -32602 "Unknown tool: $name" }
+            $toolArgs = $params.arguments
+            if ($null -eq $toolArgs) { $toolArgs = @{} }
+            try {
+                $result = Invoke-WssTool -Name $name -Arguments $toolArgs
+                $text = ConvertTo-Json -InputObject $result -Depth 30
+                return New-WssResponse $id ([ordered]@{ content = @([ordered]@{ type = 'text'; text = $text }); isError = $false })
+            } catch {
+                Write-WssLog "Tool $name failed: $($_.Exception.Message)"
+                return New-WssResponse $id ([ordered]@{ content = @([ordered]@{ type = 'text'; text = "Error: $($_.Exception.Message)" }); isError = $true })
+            }
+        }
+        'resources/list' { return New-WssResponse $id ([ordered]@{ resources = @() }) }
+        'prompts/list' { return New-WssResponse $id ([ordered]@{ prompts = @() }) }
+        default { return New-WssError $id -32601 "Method not found: $method" }
+    }
+}
+
+function Invoke-WssMessageLine {
+    <# Parses one line of input and returns the serialized response line, or $null. #>
+    param([string]$Line)
+    if (-not $Line -or $Line.Trim() -eq '') { return $null }
+    try {
+        $parsed = ConvertTo-WssHashtable ($Line | ConvertFrom-Json)
+    } catch {
+        return ConvertTo-WssJson (New-WssError $null -32700 'Parse error')
+    }
+    if ($parsed -is [array]) {
+        $responses = @()
+        foreach ($m in $parsed) {
+            if ($m -isnot [hashtable]) { $responses += New-WssError $null -32600 'Invalid Request'; continue }
+            $r = Invoke-WssRequest $m
+            if ($null -ne $r) { $responses += $r }
+        }
+        if ($responses.Count -eq 0) { return $null }
+        return ConvertTo-WssJson @($responses)
+    }
+    if ($parsed -isnot [hashtable]) { return ConvertTo-WssJson (New-WssError $null -32600 'Invalid Request') }
+    try {
+        $resp = Invoke-WssRequest $parsed
+    } catch {
+        $rid = $null; if ($parsed.ContainsKey('id')) { $rid = $parsed.id }
+        $resp = New-WssError $rid -32603 "Internal error: $($_.Exception.Message)"
+    }
+    if ($null -eq $resp) { return $null }
+    return ConvertTo-WssJson $resp
+}
+
+function Enable-WssFakeBackend {
+    <#
+      Test/demo mode: loads drives, shares and query results from a JSON file instead of Windows.
+      { "mappedDrives": [{"drive":"Z:","unc":"\\\\srv\\share"}],
+        "shares": {"srv2": ["a","b"]},
+        "results": {"SRV": [ {"System.ItemUrl": "...", ...} ]},
+        "errors": {"SRV3": "message"} }
+      Every executed SQL statement is appended to $env:WSS_FAKE_SQL_LOG when set.
+    #>
+    param([string]$Path)
+    $data = ConvertTo-WssHashtable (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json)
+    $script:FakeData = $data
+    $script:DriveProvider = {
+        $out = @()
+        if ($script:FakeData.mappedDrives) { foreach ($d in $script:FakeData.mappedDrives) { $out += @{ Drive = $d.drive; Unc = $d.unc } } }
+        return $out
+    }
+    $script:ShareProvider = {
+        param($HostName)
+        if ($script:FakeData.shares) { foreach ($k in $script:FakeData.shares.Keys) { if ($k -ieq $HostName) { return @($script:FakeData.shares[$k]) } } }
+        return @()
+    }
+    $script:QueryExecutor = {
+        param($Machine, $Sql, $Timeout)
+        if ($env:WSS_FAKE_SQL_LOG) { Add-Content -LiteralPath $env:WSS_FAKE_SQL_LOG -Value "$Machine`t$Sql" -Encoding UTF8 }
+        if ($script:FakeData.errors) { foreach ($k in $script:FakeData.errors.Keys) { if ($k -ieq $Machine) { throw $script:FakeData.errors[$k] } } }
+        if ($script:FakeData.results) { foreach ($k in $script:FakeData.results.Keys) { if ($k -ieq $Machine) { return @($script:FakeData.results[$k]) } } }
+        return @()
+    }
+}
+
+function Start-WssServer {
+    <# Runs the MCP stdio loop: newline-delimited JSON-RPC on stdin/stdout. #>
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $reader = New-Object IO.StreamReader([Console]::OpenStandardInput(), $utf8)
+    $writer = New-Object IO.StreamWriter([Console]::OpenStandardOutput(), $utf8)
+    $writer.AutoFlush = $true
+    $writer.NewLine = "`n"
+    Write-WssLog "started (version $script:ServerVersion, PowerShell $($PSVersionTable.PSVersion))"
+    while ($true) {
+        $line = $reader.ReadLine()
+        if ($null -eq $line) { break }
+        $out = Invoke-WssMessageLine $line
+        if ($null -ne $out) { $writer.WriteLine($out) }
+    }
+    Write-WssLog 'stdin closed, exiting'
+}
+
+Export-ModuleMember -Function *-Wss*

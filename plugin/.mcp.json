@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "windows-server-search": {
+      "command": "powershell.exe",
+      "args": [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${CLAUDE_PLUGIN_ROOT}/server/server.ps1"
+      ],
+      "env": {
+        "WSS_SERVERS": "${user_config.servers}",
+        "WSS_AUTO_DISCOVER": "${user_config.auto_discover}",
+        "WSS_EXCLUDE": "${user_config.exclude}",
+        "WSS_MAX_RESULTS": "${user_config.max_results}"
+      }
+    }
+  }
+}

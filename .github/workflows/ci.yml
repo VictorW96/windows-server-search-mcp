@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    name: Unit + stdio tests (${{ matrix.shell }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, shell: pwsh }
+          - { os: windows-latest, shell: pwsh }
+          - { os: windows-latest, shell: powershell }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Pester 5
+        shell: ${{ matrix.shell }}
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+      - name: Run tests
+        shell: ${{ matrix.shell }}
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $c = New-PesterConfiguration
+          $c.Run.Path = './tests'
+          $c.Run.Exit = $true
+          $c.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $c
+
+  windows-search-integration:
+    name: Real Windows Search index (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Pester 5
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+      - name: Set up Windows Search, SMB share and mapped drive
+        shell: powershell
+        run: ./tests/integration/Setup-WindowsSearch.ps1
+      - name: Run integration tests (powershell.exe 5.1 + pwsh 7)
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $c = New-PesterConfiguration
+          $c.Run.Path = './tests/integration'
+          $c.Run.Exit = $true
+          $c.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $c
+
+  build:
+    name: Build + validate plugin
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Claude Code CLI (for plugin validation)
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Build
+        run: scripts/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-server-search-plugin
+          path: dist/windows-server-search-*.zip
+
+  release:
+    name: Publish to marketplace
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [build, windows-search-integration]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches VERSION
+        run: test "v$(tr -d '[:space:]' < VERSION)" = "${GITHUB_REF_NAME}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g @anthropic-ai/claude-code
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MARKETPLACE_TOKEN: ${{ secrets.MARKETPLACE_TOKEN }}
+        run: |
+          if [ -z "$MARKETPLACE_TOKEN" ]; then
+            echo "::warning::MARKETPLACE_TOKEN secret not set - creating GitHub release only. Run scripts/release.sh locally to publish to the marketplace."
+            scripts/build.sh
+            gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" dist/*.zip --title "windows-server-search $GITHUB_REF_NAME" --generate-notes
+            exit 0
+          fi
+          scripts/release.sh

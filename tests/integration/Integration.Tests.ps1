@@ -1,0 +1,124 @@
+# Integration tests against a real Windows Search index (Windows only).
+# Prerequisite: Setup-WindowsSearch.ps1 has run (creates integration-env.json).
+#   Invoke-Pester ./tests/integration -Output Detailed
+
+BeforeDiscovery {
+    $script:Skip = -not (Test-Path (Join-Path $PSScriptRoot 'integration-env.json'))
+    $script:Hosts = @()
+    if (-not $Skip) {
+        $script:Hosts += @{ Name = 'Windows PowerShell 5.1'; Exe = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') }
+        $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+        if ($pwsh) { $script:Hosts += @{ Name = 'PowerShell 7'; Exe = $pwsh.Source } }
+    }
+}
+
+BeforeAll {
+    if (-not (Test-Path (Join-Path $PSScriptRoot 'integration-env.json'))) { return }
+    $script:Env = Get-Content (Join-Path $PSScriptRoot 'integration-env.json') -Raw | ConvertFrom-Json
+    $script:ServerScript = (Resolve-Path (Join-Path $PSScriptRoot '../../server/server.ps1')).Path
+
+    function Invoke-Mcp([string]$Exe, [string[]]$Lines, [hashtable]$ExtraEnv = @{}) {
+        $psi = New-Object Diagnostics.ProcessStartInfo
+        $psi.FileName = $Exe
+        $psi.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ServerScript`""
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $utf8 = New-Object Text.UTF8Encoding($false)
+        $psi.StandardOutputEncoding = $utf8
+        $psi.StandardErrorEncoding = $utf8
+        foreach ($k in 'WSS_FAKE_BACKEND', 'WSS_SERVERS', 'WSS_EXCLUDE') { $psi.EnvironmentVariables.Remove($k) }
+        foreach ($k in $ExtraEnv.Keys) { $psi.EnvironmentVariables[$k] = $ExtraEnv[$k] }
+        $p = [Diagnostics.Process]::Start($psi)
+        $w = New-Object IO.StreamWriter($p.StandardInput.BaseStream, $utf8)
+        $all = @('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}', '{"jsonrpc":"2.0","method":"notifications/initialized"}') + $Lines
+        foreach ($l in $all) { $w.Write($l + "`n") }
+        $w.Close()
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $out = $p.StandardOutput.ReadToEnd()
+        if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'server timeout' }
+        $script:LastStderr = $errTask.Result
+        Write-Host $script:LastStderr
+        $msgs = @($out -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
+        return $msgs | Where-Object { $_.id -ne 0 }
+    }
+    function Get-ToolJson($msg) {
+        if ($msg.result.isError) { throw "Tool error: $($msg.result.content[0].text)" }
+        return $msg.result.content[0].text | ConvertFrom-Json
+    }
+    function Call([int]$Id, [string]$Tool, [hashtable]$Arguments) {
+        return (@{ jsonrpc = '2.0'; id = $Id; method = 'tools/call'; params = @{ name = $Tool; arguments = $Arguments } } | ConvertTo-Json -Depth 10 -Compress)
+    }
+
+}
+
+if ($Hosts.Count -eq 0) { $Hosts = @(@{ Name = 'n/a (no integration-env.json)'; Exe = '' }) }
+Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
+    BeforeAll {
+        $script:Msgs = @(Invoke-Mcp $Exe @(
+                (Call 1 'list_servers' @{ check = $true }),
+                (Call 2 'search_files' @{ query = $Env.Token }),
+                (Call 3 'search_files' @{ query = $Env.Token; match = 'filename' }),
+                (Call 4 'search_files' @{ query = $Env.Token; path = "$($Env.Drive)\sub folder" }),
+                (Call 5 'search_files' @{ extensions = @('log'); sort = 'modified' }),
+                (Call 6 'read_file' @{ path = "$($Env.Drive)\alpha.txt" }),
+                (Call 7 'list_directory' @{ path = "$($Env.Drive)\" }),
+                (Call 8 'read_file' @{ path = 'C:\Windows\win.ini' })
+            ))
+    }
+
+    It 'auto-discovers the mapped drive as a Windows server' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 1)
+        $srv = @($r.servers | Where-Object { $_.name -ieq $Env.Computer })
+        $srv.Count | Should -Be 1 -Because ($r | ConvertTo-Json -Depth 10)
+        @($srv[0].sources) | Should -Contain 'mapped-drive'
+        $share = @($srv[0].shares | Where-Object { $_.name -ieq $Env.Share })
+        @($share[0].drives) | Should -Contain $Env.Drive
+        $srv[0].index.status | Should -Be 'ok' -Because $srv[0].index.detail
+    }
+
+    It 'finds files by content through the remote index query' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 2)
+        $names = @($r.results | ForEach-Object { $_.name })
+        $names | Should -Contain 'alpha.txt'
+        $names | Should -Contain 'beta notes.txt'
+        $alpha = $r.results | Where-Object name -eq 'alpha.txt'
+        $alpha.drive_path | Should -Be "$($Env.Drive)\alpha.txt"
+        $alpha.path | Should -BeLike "\\*\$($Env.Share)\alpha.txt"
+        $alpha.size | Should -BeGreaterThan 0
+    }
+
+    It 'finds files by name only' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 3)
+        @($r.results | ForEach-Object { $_.name }) | Should -Be @("$($Env.Token)-name-only.log")
+    }
+
+    It 'scopes a search to a sub folder of the drive' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 4)
+        @($r.results | ForEach-Object { $_.name }) | Should -Be @('beta notes.txt')
+    }
+
+    It 'filters by extension without a query' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 5)
+        @($r.results | ForEach-Object { $_.name }) | Should -Contain "$($Env.Token)-name-only.log"
+        @($r.results | Where-Object { $_.name -notlike '*.log' }).Count | Should -Be 0
+    }
+
+    It 'reads a file through the mapped drive' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 6)
+        $r.content | Should -Match $Env.Token
+        $r.path | Should -BeLike "\\*\$($Env.Share)\alpha.txt"
+    }
+
+    It 'lists a directory' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 7)
+        @($r.entries | ForEach-Object { $_.name }) | Should -Contain 'sub folder'
+        @($r.entries | ForEach-Object { $_.name }) | Should -Contain 'alpha.txt'
+    }
+
+    It 'refuses to read local files outside the server shares' {
+        $m = $Msgs | Where-Object id -eq 8
+        $m.result.isError | Should -BeTrue
+    }
+}

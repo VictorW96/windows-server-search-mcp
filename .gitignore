@@ -1,0 +1,4 @@
+dist/
+tests/integration/integration-env.json
+testResults.xml
+.DS_Store

@@ -1,0 +1,42 @@
+{
+  "name": "windows-server-search",
+  "version": "__VERSION__",
+  "description": "Search Windows file servers through their Windows Search index. Automatically uses the network drives already mapped on this PC (e.g. Z: -> \\\\fileserver\\share); no setup needed. Windows only.",
+  "author": { "name": "Victor Wolf", "url": "https://github.com/VictorW96" },
+  "homepage": "https://github.com/VictorW96/windows-server-search-mcp",
+  "repository": "https://github.com/VictorW96/windows-server-search-mcp",
+  "license": "MIT",
+  "keywords": ["windows", "search", "file-server", "smb", "network-drive", "windows-search", "mcp"],
+  "userConfig": {
+    "servers": {
+      "type": "string",
+      "title": "Additional servers / shares",
+      "description": "Optional. UNC paths to search in addition to mapped drives, separated by ';' (e.g. \\\\fs01\\projects;\\\\fs02). A bare server name searches all of its shares.",
+      "default": "",
+      "required": false
+    },
+    "auto_discover": {
+      "type": "boolean",
+      "title": "Use mapped network drives",
+      "description": "Automatically search all Windows servers behind the network drives mapped on this PC.",
+      "default": true,
+      "required": false
+    },
+    "exclude": {
+      "type": "string",
+      "title": "Exclude servers / shares",
+      "description": "Optional. Server names or UNC share paths to ignore, separated by ';'.",
+      "default": "",
+      "required": false
+    },
+    "max_results": {
+      "type": "number",
+      "title": "Default maximum results",
+      "description": "Default number of results returned per search (1-500).",
+      "default": 50,
+      "min": 1,
+      "max": 500,
+      "required": false
+    }
+  }
+}
