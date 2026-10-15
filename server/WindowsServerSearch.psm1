@@ -1705,10 +1705,12 @@ function Test-WssOwnPermissions {
     param([string]$Path)
     if (-not (Test-WssIsWindows)) { return $false }
     try {
-        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        # .NET directly, not Get-Acl: its module fails to load in powershell.exe 5.1 started from pwsh 7 (PSModulePath).
+        $acl = New-Object System.Security.AccessControl.FileSecurity($Path, [System.Security.AccessControl.AccessControlSections]::Access)
         if ($acl.AreAccessRulesProtected) { return $true }
         return (@($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])).Count -gt 0)
     } catch {
+        Write-WssLog "Could not read the permissions of '$Path': $($_.Exception.Message)"
         return $true
     }
 }
