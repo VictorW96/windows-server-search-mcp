@@ -609,14 +609,51 @@ function ConvertTo-WssResult {
     return $result
 }
 
-function Get-WssErrorMessage {
-    param($ErrorRecord, [string]$Machine)
-    $msg = $ErrorRecord.Exception.Message
-    $hint = ''
-    if ($msg -match '0x80040E37|0x80070005|0x800706BA|0x80070035|0x80040154|Remote|RPC|not found|nicht gefunden') {
-        $hint = " Hint: remote index queries require the 'Windows Search Service' on '$Machine' to be installed/running and to index the shared folder, and the share must be reachable by its NetBIOS name."
+function Get-WssErrorCode {
+    <# Returns the HRESULT of a failed index query as '0x8004....', or $null. COM errors are usually wrapped
+       in a MethodInvocationException, so the exception chain is searched for the COM HRESULT. #>
+    param($Exception)
+    $e = $Exception
+    while ($e) {
+        $h = 0
+        try { $h = [int]$e.HResult } catch { }
+        if ($e -is [Runtime.InteropServices.COMException] -and $h -ne 0) { return ('0x{0:X8}' -f $h) }
+        $e = $e.InnerException
     }
-    return "$msg$hint"
+    $m = [regex]::Match("$($Exception.Message)", '0x[0-9A-Fa-f]{8}')
+    if ($m.Success) { return $m.Value.ToUpperInvariant().Replace('0X', '0x') }
+    return $null
+}
+
+function Get-WssErrorMessage {
+    <# Adds the error code and a hint matching the actual failure. Only claims a missing search service
+       where that is a plausible cause, so access or client problems are not reported as server problems. #>
+    param($ErrorRecord, [string]$Machine)
+    $ex = $ErrorRecord.Exception
+    $msg = "$($ex.Message)".Trim()
+    $code = Get-WssErrorCode $ex
+    if ($code -and $msg -notmatch [regex]::Escape($code)) { $msg = "$msg (error $code)" }
+    $alias = "If File Explorer on this PC finds words inside files on this drive, the server's search service works and '$Machine' is probably not the file server's real name (DFS namespace or DNS alias): add the real server, e.g. \\realserver\share, to the 'servers' setting."
+    $hint = switch -Regex ("$code $msg") {
+        '0x80040E37|table does not exist|Tabelle' {
+            "Hint: the search index on '$Machine' could not be opened. Either the Windows Search Service is not running on '$Machine' or does not index this share, or: $alias"; break
+        }
+        '0x80070005|access is denied|Zugriff verweigert' {
+            "Hint: access denied. The current Windows user may not query the search index on '$Machine'; this is a permission problem, not a missing search service."; break
+        }
+        '0x80040154|0x800401F3|class not registered|Klasse nicht registriert' {
+            "Hint: the Windows Search query component (Search.CollatorDSO / ADODB) is not available on this PC. The problem is on this PC, not on the file server."; break
+        }
+        '0x80040E31|timeout|time-out|Zeitlimit' {
+            "Hint: the index query on '$Machine' timed out. Narrow the search with 'path' or raise 'queryTimeout'."; break
+        }
+        '0x800706BA|0x800706D9|0x80070035|0x80070043|RPC' {
+            "Hint: '$Machine' could not be reached for an index query (name not resolvable, firewall, or the Windows Search Service is stopped there). $alias"; break
+        }
+        default { '' }
+    }
+    if ($hint) { return "$msg $hint" }
+    return $msg
 }
 
 function Select-WssTargets {

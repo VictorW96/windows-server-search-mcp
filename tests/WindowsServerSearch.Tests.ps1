@@ -311,6 +311,20 @@ Describe 'Search-Wss' {
         $r.result_count | Should -Be 1
         $r.errors[0].server | Should -Be 'fs02'
         $r.errors[0].error | Should -Match 'Windows Search Service'
+        $r.errors[0].error | Should -Match 'DFS'
+    }
+    It 'gives error-specific hints and only blames the search service where plausible' {
+        $err = { param($ex) [Management.Automation.ErrorRecord]::new($ex, 'x', 'NotSpecified', $null) }
+        $denied = Get-WssErrorMessage (& $err ([Runtime.InteropServices.COMException]::new('Access is denied.', [int]0x80070005))) 'fs01'
+        $denied | Should -Match '\(error 0x80070005\)'
+        $denied | Should -Match 'permission problem'
+        $denied | Should -Not -Match 'not running'
+        $wrapped = [Management.Automation.MethodInvocationException]::new('Exception calling "Open"', [Runtime.InteropServices.COMException]::new('Unspecified', [int]0x80040154))
+        $client = Get-WssErrorMessage (& $err $wrapped) 'fs01'
+        $client | Should -Match '0x80040154'
+        $client | Should -Match 'on this PC, not on the file server'
+        $other = Get-WssErrorMessage (& $err ([Exception]::new('Item not found'))) 'fs01'
+        $other | Should -Be 'Item not found'
     }
     It 'throws when every server fails' {
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' }) -Errors @{ fs01 = 'nope' }

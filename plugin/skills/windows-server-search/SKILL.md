@@ -66,10 +66,13 @@ share or through Group Policy, or by the user in the plugin settings. Blocked it
   or to add servers. In Cowork, plugin settings can't be edited in the app, so the user has to create
   `%APPDATA%\windows-server-search-mcp\config.json` on their PC, e.g.
   `{ "servers": ["\\\\fs01\\projects"] }`. Explain this; you cannot write that file yourself.
-- *Index errors* (`0x80040E37`, RPC errors, "table does not exist"): the file server must run the
-  **Windows Search Service** (Windows Server feature "Windows Search Service") and index the shared folder.
-  An administrator has to enable this on the server; the plugin cannot. `read_file` / `list_directory`
-  still work without an index.
+- *Index errors*: pass on the error code and the hint the tool returns, and don't claim that the search service
+  is off unless the hint says that's a possible cause. Access denied (`0x80070005`) is a permission problem,
+  and `0x80040154` is a problem on this PC. For `0x80040E37` ("table does not exist") or RPC errors, either the file server doesn't
+  run the **Windows Search Service** for this share, or the drive points to a DFS namespace or DNS alias
+  instead of the real server. If File Explorer search on the drive finds words inside files, the service works,
+  so the user should add the real server (`\\realserver\share`) to `servers` in the config file.
+  `read_file` / `list_directory` still work without an index.
 - Results only contain files the current Windows user is allowed to read.
 - `copy_file` only writes to ordinary local folders on this PC: never to a server share or network drive, and never to
   system or configuration folders (`AppData`, `.ssh`, …). Programs and scripts only go to the workspace or download folder.
