@@ -96,6 +96,13 @@ Describe 'Get-WssConfig' {
         $c.MaxResults | Should -Be 50
         $c.AutoDiscover | Should -BeTrue
     }
+    It 'ignores unresolved plugin placeholders' {
+        $env:WSS_SERVERS = '${user_config.servers}'
+        $env:WSS_MAX_RESULTS = '${user_config.max_results}'
+        $c = Get-WssConfig
+        $c.Servers.Count | Should -Be 0
+        $c.MaxResults | Should -Be 50
+    }
     It 'reads the JSON config file, env wins' {
         '{"servers":["\\\\fs09\\x"],"maxResults":7,"autoDiscover":false}' | Set-Content -LiteralPath $env:WSS_CONFIG_FILE
         $c = Get-WssConfig

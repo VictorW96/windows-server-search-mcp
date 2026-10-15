@@ -103,6 +103,8 @@ function Get-WssConfig {
 
     function Pick($envName, $fileKey) {
         $v = [Environment]::GetEnvironmentVariable($envName)
+        # Ignore unresolved plugin placeholders such as ${user_config.servers}
+        if ($null -ne $v -and "$v" -match '^\s*\$\{[^}]*\}\s*$') { $v = $null }
         if ($null -ne $v -and "$v".Trim() -ne '') { return $v }
         if ($file.ContainsKey($fileKey)) {
             $fv = $file[$fileKey]

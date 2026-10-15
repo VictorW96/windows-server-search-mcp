@@ -115,8 +115,8 @@ if (Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue) { Remove-SmbSha
 New-SmbShare -Name $ShareName -Path $Folder -ReadAccess 'Everyone' | Out-Null
 $unc = "\\$env:COMPUTERNAME\$ShareName"
 Step "Mapping ${DriveLetter}: -> $unc"
-cmd /c "net use ${DriveLetter}: /delete /y" 2>$null | Out-Null
-cmd /c "net use ${DriveLetter}: $unc /persistent:no" | Out-Host
+cmd /c "net use ${DriveLetter}: /delete /y >nul 2>&1"
+cmd /c "net use ${DriveLetter}: $unc /persistent:no 2>&1" | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "net use failed with exit code $LASTEXITCODE" }
 
 # --- 4. Wait for indexing -------------------------------------------------------
