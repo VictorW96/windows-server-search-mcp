@@ -51,7 +51,9 @@ share or through Group Policy, or by the user in the plugin settings. Blocked it
 ## Troubleshooting
 
 - *No servers found*: no network drive is mapped. Ask the user to map one (`net use Z: \\server\share`)
-  or set "Additional servers / shares" in the plugin settings.
+  or to add servers. In Cowork, plugin settings can't be edited in the app, so the user has to create
+  `%APPDATA%\windows-server-search-mcp\config.json` on their PC, e.g.
+  `{ "servers": ["\\\\fs01\\projects"] }`. Explain this; you cannot write that file yourself.
 - *Index errors* (`0x80040E37`, RPC errors, "table does not exist"): the file server must run the
   **Windows Search Service** (Windows Server feature "Windows Search Service") and index the shared folder.
   An administrator has to enable this on the server; the plugin cannot. `read_file` / `list_directory`

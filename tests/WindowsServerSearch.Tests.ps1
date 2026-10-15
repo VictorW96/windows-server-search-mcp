@@ -111,14 +111,31 @@ Describe 'Get-WssConfig' {
         $c.Servers.Count | Should -Be 0
         $c.MaxResults | Should -Be 50
     }
-    It 'reads the JSON config file, env wins' {
+    It 'reads the JSON config file' {
         '{"servers":["\\\\fs09\\x"],"maxResults":7,"autoDiscover":false}' | Set-Content -LiteralPath $env:WSS_CONFIG_FILE
         $c = Get-WssConfig
         $c.Servers | Should -Be @('\\fs09\x')
         $c.MaxResults | Should -Be 7
         $c.AutoDiscover | Should -BeFalse
-        $env:WSS_MAX_RESULTS = '3'
-        (Get-WssConfig).MaxResults | Should -Be 3
+    }
+    It 'config file beats plugin defaults (Cowork cannot edit plugin options)' {
+        '{"maxResults":7,"autoDiscover":false,"downloadDir":"C:\\dl"}' | Set-Content -LiteralPath $env:WSS_CONFIG_FILE
+        # what Cowork passes: the plugin defaults
+        $env:WSS_MAX_RESULTS = '50'; $env:WSS_AUTO_DISCOVER = 'true'; $env:WSS_DOWNLOAD_DIR = ''
+        $c = Get-WssConfig
+        $c.MaxResults | Should -Be 7
+        $c.AutoDiscover | Should -BeFalse
+        $c.DownloadDir | Should -Be 'C:\dl'
+        Remove-Item env:WSS_DOWNLOAD_DIR -ErrorAction SilentlyContinue
+    }
+    It 'merges list settings from plugin options and config file' {
+        '{"servers":["\\\\fs09\\x"],"deny":["**\\HR","**\\Personal"]}' | Set-Content -LiteralPath $env:WSS_CONFIG_FILE
+        $env:WSS_SERVERS = '\\fs01\a;\\fs09\x'
+        $env:WSS_DENY = '*.kdbx'
+        $c = Get-WssConfig
+        $c.Servers | Should -Be @('\\fs01\a', '\\fs09\x')
+        $c.Deny | Should -Be @('*.kdbx', '**\HR', '**\Personal')
+        Remove-Item env:WSS_DENY -ErrorAction SilentlyContinue
     }
 }
 
@@ -456,6 +473,12 @@ Describe 'copy_file helpers' {
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
         $cfg = New-TestConfig; $cfg.MaxCopyMB = 1
         { Copy-WssFiles -Arguments @{ paths = @('\\evil\x\y.pdf'); destination = (Join-Path $Base 'dst') } -Config $cfg } | Should -Throw '*outside the known*'
+    }
+    It 'refuses to copy into the plugin configuration folder' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        $cfg = New-TestConfig; $cfg.ConfigFile = (Join-Path $Base 'cfgdir/config.json')
+        { Copy-WssFiles -Arguments @{ path = '\\fs01\p\config.json'; destination = (Join-Path $Base 'cfgdir') } -Config $cfg } | Should -Throw '*configuration folder*'
+        { Copy-WssFiles -Arguments @{ path = '\\fs01\p\config.json'; destination = (Join-Path $Base 'cfgdir'); subfolder = 'x' } -Config $cfg } | Should -Throw '*configuration folder*'
     }
     It 'rejects subfolder traversal' {
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })

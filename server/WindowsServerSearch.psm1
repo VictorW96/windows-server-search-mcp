@@ -78,7 +78,9 @@ function Split-WssList {
 function Get-WssConfig {
     <#
       Reads configuration from environment variables (set by the plugin's userConfig)
-      and an optional JSON config file. Environment variables win.
+      and an optional JSON config file. List settings (servers, exclude, deny) are merged;
+      for single values the config file wins, because Cowork has no UI for plugin options
+      and always passes the plugin defaults - the file is how Cowork users change them.
         WSS_SERVERS          ; or , separated UNC roots, e.g. \\fs01\projects;\\fs02
         WSS_AUTO_DISCOVER    true|false (default true) - use mapped network drives
         WSS_EXCLUDE          ; separated server names or UNC roots to ignore
@@ -105,27 +107,43 @@ function Get-WssConfig {
         }
     }
 
-    function Pick($envName, $fileKey) {
+    function Get-EnvValue($envName) {
         $v = [Environment]::GetEnvironmentVariable($envName)
         # Ignore unresolved plugin placeholders such as ${user_config.servers}
         if ($null -ne $v -and "$v" -match '^\s*\$\{[^}]*\}\s*$') { $v = $null }
-        if ($null -ne $v -and "$v".Trim() -ne '') { return $v }
-        if ($file.ContainsKey($fileKey)) {
-            $fv = $file[$fileKey]
-            if ($fv -is [array]) { return ($fv -join ';') }
-            return $fv
-        }
+        if ($null -ne $v -and "$v".Trim() -ne '') { return "$v" }
         return $null
+    }
+    function Get-FileValue($fileKey) {
+        if (-not $file.ContainsKey($fileKey) -or $null -eq $file[$fileKey]) { return $null }
+        $fv = $file[$fileKey]
+        if ($fv -is [array]) { return ($fv -join ';') }
+        if ("$fv".Trim() -eq '') { return $null }
+        return $fv
+    }
+    function Pick($envName, $fileKey) {
+        # Single value: config file first, then plugin option / environment.
+        $fv = Get-FileValue $fileKey
+        if ($null -ne $fv) { return $fv }
+        return (Get-EnvValue $envName)
+    }
+    function PickList($envName, $fileKey, $separators = '[;,\r\n]+') {
+        # List: union of plugin option / environment and config file.
+        $out = @()
+        foreach ($x in @(Split-WssList (Get-EnvValue $envName) $separators) + @(Split-WssList (Get-FileValue $fileKey) $separators)) {
+            if (-not ($out -contains $x)) { $out += $x }
+        }
+        return $out
     }
 
     return @{
-        Servers        = @(Split-WssList (Pick 'WSS_SERVERS' 'servers'))
+        Servers        = @(PickList 'WSS_SERVERS' 'servers')
         AutoDiscover   = ConvertTo-WssBool (Pick 'WSS_AUTO_DISCOVER' 'autoDiscover') $true
-        Exclude        = @(Split-WssList (Pick 'WSS_EXCLUDE' 'exclude'))
+        Exclude        = @(PickList 'WSS_EXCLUDE' 'exclude')
         MaxResults     = ConvertTo-WssInt (Pick 'WSS_MAX_RESULTS' 'maxResults') 50 1 500
         QueryTimeout   = ConvertTo-WssInt (Pick 'WSS_QUERY_TIMEOUT' 'queryTimeout') 30 1 600
         UseNetBios     = ConvertTo-WssBool (Pick 'WSS_USE_NETBIOS' 'useNetBios') $true
-        Deny           = @(Split-WssList (Pick 'WSS_DENY' 'deny') '[;\r\n]+')
+        Deny           = @(PickList 'WSS_DENY' 'deny' '[;\r\n]+')
         PolicyTtl      = ConvertTo-WssInt (Pick 'WSS_POLICY_TTL' 'policyTtl') 300 0 86400
         DownloadDir    = (Pick 'WSS_DOWNLOAD_DIR' 'downloadDir')
         MaxCopyMB      = ConvertTo-WssInt (Pick 'WSS_MAX_COPY_MB' 'maxCopyMB') 500 1 102400
@@ -1425,6 +1443,13 @@ function Copy-WssFiles {
         $sub = "$($Arguments.subfolder)"
         if ($sub -match '(^|[\\/])\.\.([\\/]|$)' -or [IO.Path]::IsPathRooted($sub) -or $sub -match '[:*?"<>|]') { throw "Invalid subfolder '$sub'." }
         $dest = [IO.Path]::GetFullPath([IO.Path]::Combine($dest, $sub))
+    }
+    if ($Config.ConfigFile) {
+        $cfgDir = [IO.Path]::GetFullPath([IO.Path]::GetDirectoryName($Config.ConfigFile)).TrimEnd('\', '/')
+        $sep = [IO.Path]::DirectorySeparatorChar
+        if ($dest.TrimEnd('\', '/') -ieq $cfgDir -or $dest.StartsWith($cfgDir + $sep, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Destination '$dest' is the configuration folder of this plugin; choose another folder."
+        }
     }
     if (-not (Test-Path -LiteralPath $dest -PathType Container)) { [void](New-Item -ItemType Directory -Path $dest -Force) }
 

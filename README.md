@@ -112,21 +112,38 @@ reg add HKLM\SOFTWARE\Policies\WindowsServerSearchMcp /v DenyPaths /t REG_MULTI_
 
 ## Configuration
 
-Plugin options (Cowork: plugin settings; Claude Code: `claude plugin configure windows-server-search`).
-All options are optional.
+All settings are optional. A PC with mapped network drives works without any configuration.
 
-| Option | Env variable | Default | Meaning |
+**Where to set them:**
+
+- **Claude Code:** `claude plugin configure windows-server-search`, or `/plugin` → the plugin → configure.
+- **Claude Cowork:** Cowork has no UI for plugin options and always uses the defaults.
+  ([docs](https://claude.com/docs/plugins/platform-support): "Cowork doesn't prompt for values")
+  Use the config file instead:
+  `%APPDATA%\windows-server-search-mcp\config.json`. It needs no admin rights; see the
+  [example](examples/config.json). The server reads it at every tool call, so changes apply immediately.
+- **Company-wide:** blocked paths come from Group Policy or `.claude-policy` files on the shares; see
+  [Access policy](#access-policy-blocked-paths).
+
+**How the sources combine:**
+
+- List settings (`servers`, `exclude`, `deny`) from the plugin options and the config file are merged.
+- For single values (`autoDiscover`, `maxResults`, `downloadDir`, …) the **config file wins** over the
+  plugin options, because Cowork always passes the defaults.
+- `copy_file` refuses to write into the config folder.
+
+| Plugin option | Config file key / env variable | Default | Meaning |
 |---|---|---|---|
-| Additional servers / shares | `WSS_SERVERS` | – | `;`-separated UNC paths, e.g. `\\fs01\projects;\\fs02`. A bare server searches all its shares (via `net view`) |
-| Use mapped network drives | `WSS_AUTO_DISCOVER` | `true` | Auto-discover servers from mapped drives (CIM `Win32_LogicalDisk`, `HKCU\Network`, PSDrives) |
-| Exclude servers / shares | `WSS_EXCLUDE` | – | `;`-separated server names or UNC shares to ignore |
-| Blocked paths | `WSS_DENY` | – | `;`-separated wildcard patterns; see [Access policy](#access-policy-blocked-paths) |
-| – | `WSS_POLICY_TTL` | `300` | Seconds to cache share `.claude-policy` files |
-| Default maximum results | `WSS_MAX_RESULTS` | `50` | 1–500 |
-| Download folder | `WSS_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads\Windows Server Search` | Default destination for `copy_file` |
-| – | `WSS_MAX_COPY_MB` | `500` | Maximum size per copied file |
-| – | `WSS_QUERY_TIMEOUT` | `30` | Seconds per index query |
-| – | `WSS_USE_NETBIOS` | `true` | Query FQDN hosts by their NetBIOS name, which Windows Search requires |
+| Additional servers / shares | `servers` / `WSS_SERVERS` | – | `;`-separated UNC paths, e.g. `\\fs01\projects;\\fs02`. A bare server searches all its shares (via `net view`) |
+| Use mapped network drives | `autoDiscover` / `WSS_AUTO_DISCOVER` | `true` | Auto-discover servers from mapped drives (CIM `Win32_LogicalDisk`, `HKCU\Network`, PSDrives) |
+| Exclude servers / shares | `exclude` / `WSS_EXCLUDE` | – | `;`-separated server names or UNC shares to ignore |
+| Blocked paths | `deny` / `WSS_DENY` | – | `;`-separated wildcard patterns; see [Access policy](#access-policy-blocked-paths) |
+| – | `policyTtl` / `WSS_POLICY_TTL` | `300` | Seconds to cache share `.claude-policy` files |
+| Default maximum results | `maxResults` / `WSS_MAX_RESULTS` | `50` | 1–500 |
+| Download folder | `downloadDir` / `WSS_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads\Windows Server Search` | Default destination for `copy_file` |
+| – | `maxCopyMB` / `WSS_MAX_COPY_MB` | `500` | Maximum size per copied file |
+| – | `queryTimeout` / `WSS_QUERY_TIMEOUT` | `30` | Seconds per index query |
+| – | `useNetBios` / `WSS_USE_NETBIOS` | `true` | Query FQDN hosts by their NetBIOS name, which Windows Search requires |
 | – | `WSS_CONFIG_FILE` | `%APPDATA%\windows-server-search-mcp\config.json` | JSON file with `servers`, `exclude`, `autoDiscover`, `maxResults`, … |
 
 ### Server requirements
