@@ -487,7 +487,7 @@ function Invoke-WssQuery {
             [void]$rows.Add($row)
             $rs.MoveNext()
         }
-        return , $rows.ToArray()
+        return $rows.ToArray()
     } finally {
         if ($rs) { try { if ($rs.State -ne 0) { $rs.Close() } } catch { }; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($rs) }
         try { if ($conn.State -ne 0) { $conn.Close() } } catch { }
