@@ -300,7 +300,7 @@ Describe 'Write protection defaults' -Skip:$Skip {
         '{}' | Set-Content -LiteralPath $empty
         $m = @(Invoke-Mcp $exe @('{"jsonrpc":"2.0","id":1,"method":"tools/list"}') @{ WSS_CONFIG_FILE = $empty })
         @(($m | Where-Object id -eq 1).result.tools.name) | Should -Contain 'save_file'
-        ($m | Where-Object id -eq 1).result.tools | Where-Object name -eq 'save_file' | ForEach-Object { $_.annotations.destructiveHint | Should -BeFalse }
+        ($m | Where-Object id -eq 1).result.tools | Where-Object name -eq 'save_file' | ForEach-Object { $_.annotations.destructiveHint | Should -BeTrue }
 
         $off = Join-Path $env:TEMP 'wss-off\config.json'
         New-Item -ItemType Directory -Path (Split-Path $off) -Force | Out-Null

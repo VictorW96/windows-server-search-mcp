@@ -43,13 +43,14 @@ so the server sees your mapped drives and Windows credentials.
 
 ### Writing to servers (`save_file`, on by default)
 
-Writing is **enabled by default**. Claude can save new files to every known share except blocked paths.
-Overwriting existing files stays **off** until `allowOverwrite` is set. To change this:
+Writing and overwriting are **enabled by default**. Claude can save files to every known share except
+blocked paths. When it replaces a file (`overwrite: true`), the previous version is always kept as a backup.
+To restrict this:
 
 ```json
 // %APPDATA%\windows-server-search-mcp\config.json  (Cowork)  – or plugin options allow_write / allow_overwrite (Claude Code)
-{ "write": { "enabled": false } }   // either: turn writing off
-{ "write": { "allowOverwrite": true, "maxMB": 100, "logPath": "\\\\fs01\\it\\claude-writes.jsonl" } } // or: allow overwrite + central log
+{ "write": { "enabled": false } }   // either: turn writing off completely
+{ "write": { "allowOverwrite": false, "maxMB": 100, "logPath": "\\\\fs01\\it\\claude-writes.jsonl" } } // or: never replace files + central log
 ```
 
 - **Group Policy veto:** `DisableWrite = 1` (DWORD) under `HKLM\SOFTWARE\Policies\WindowsServerSearchMcp`
@@ -71,7 +72,7 @@ Overwriting existing files stays **off** until `allowOverwrite` is set. To chang
   Password vaults and certificates (`*.kdbx`, `*.pfx`, …) are refused even when renamed.
 - **No silent overwrites:**
   - an existing file gets a numbered copy (`report (1).docx`);
-  - `overwrite: true` replaces it only when `allowOverwrite` is configured, and the previous version is kept
+  - `overwrite: true` replaces it (unless `allowOverwrite` is `false`), and the previous version is kept
     as `report.docx.claude-backup-<yyyyMMdd-HHmmss>` (the save's date and time).
 - **No half-written files:** content goes to a hidden temp file in the target folder and is then renamed.
 - **Audit log:** each write is a JSON line (time, user, computer, source, target, size, overwritten, backup)
@@ -183,7 +184,7 @@ All settings are optional. A PC with mapped network drives works without any con
 | Download folder | `downloadDir` / `WSS_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads\Windows Server Search` | Default destination for `copy_file` |
 | – | `maxCopyMB` / `WSS_MAX_COPY_MB` | `500` | Maximum size per copied file |
 | Allow writing to servers | `write.enabled` / `WSS_WRITE_ENABLED` | `true` | `save_file`; set `false` to disable |
-| Allow overwriting files | `write.allowOverwrite` / `WSS_WRITE_OVERWRITE` | `false` | `overwrite: true` replaces files (with backup) |
+| Allow overwriting files | `write.allowOverwrite` / `WSS_WRITE_OVERWRITE` | `true` | `overwrite: true` replaces files (with backup); `false` = numbered copies only |
 | – | `write.maxMB` / `WSS_WRITE_MAX_MB` | `100` | Maximum size per written file |
 | – | `write.logPath` / `WSS_WRITE_LOG` | `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl` | Write audit log |
 | – | `queryTimeout` / `WSS_QUERY_TIMEOUT` | `30` | Seconds per index query |

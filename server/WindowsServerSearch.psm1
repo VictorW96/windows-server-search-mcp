@@ -92,7 +92,7 @@ function Get-WssConfig {
         WSS_DOWNLOAD_DIR     default local folder for copy_file
         WSS_MAX_COPY_MB      maximum size per copied file in MB (default 500)
         WSS_WRITE_ENABLED    true|false (default true) - save_file (write to servers)
-        WSS_WRITE_OVERWRITE  true|false (default false) - allow overwriting (old version kept as backup)
+        WSS_WRITE_OVERWRITE  true|false (default true) - allow overwriting (old version kept as backup)
         WSS_WRITE_MAX_MB     maximum size per written file in MB (default 100)
         WSS_WRITE_LOG        write log path (default %LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl)
         WSS_CONFIG_FILE      path to JSON config file (default %APPDATA%\windows-server-search-mcp\config.json)
@@ -157,7 +157,7 @@ function Get-WssConfig {
         DownloadDir    = (Pick 'WSS_DOWNLOAD_DIR' 'downloadDir')
         MaxCopyMB      = ConvertTo-WssInt (Pick 'WSS_MAX_COPY_MB' 'maxCopyMB') 500 1 102400
         WriteEnabled   = ConvertTo-WssBool (Pick 'WSS_WRITE_ENABLED' 'writeEnabled') $true
-        WriteAllowOverwrite = ConvertTo-WssBool (Pick 'WSS_WRITE_OVERWRITE' 'writeAllowOverwrite') $false
+        WriteAllowOverwrite = ConvertTo-WssBool (Pick 'WSS_WRITE_OVERWRITE' 'writeAllowOverwrite') $true
         WriteMaxMB     = ConvertTo-WssInt (Pick 'WSS_WRITE_MAX_MB' 'writeMaxMB') 100 1 102400
         WriteLogPath   = (Pick 'WSS_WRITE_LOG' 'writeLogPath')
         ConfigFile     = $path

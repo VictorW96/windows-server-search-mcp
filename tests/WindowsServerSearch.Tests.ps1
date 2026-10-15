@@ -652,10 +652,10 @@ Describe 'save_file' {
         Remove-Item $WBase -Recurse -Force -ErrorAction SilentlyContinue
         & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = $null }
     }
-    It 'is enabled by default (overwrite off) and hidden from tools/list when disabled' {
+    It 'is enabled by default (with overwrite) and hidden from tools/list when disabled' {
         $c = Get-WssConfig
         $c.WriteEnabled | Should -BeTrue
-        $c.WriteAllowOverwrite | Should -BeFalse
+        $c.WriteAllowOverwrite | Should -BeTrue
         @(Get-WssToolDefinitions | ForEach-Object { $_.name }) | Should -Not -Contain 'save_file'
         @(Get-WssToolDefinitions -IncludeWrite $true | ForEach-Object { $_.name }) | Should -Contain 'save_file'
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })

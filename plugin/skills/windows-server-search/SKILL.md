@@ -42,8 +42,8 @@ The `windows-server-search` MCP server queries the **Windows Search index of the
      is created – mention the new name.
    - Blocked paths, `.claude-policy` files and programs/scripts (`.exe`, `.ps1`, …) can't be written.
    - If the tool is missing, writing was disabled by the user (`"write": { "enabled": false }` in
-     `%APPDATA%\windows-server-search-mcp\config.json`) or by IT (Group Policy). Replacing existing files
-     additionally needs `"allowOverwrite": true` in that file.
+     `%APPDATA%\windows-server-search-mcp\config.json`) or by IT (Group Policy). If replacing files is refused,
+     `"allowOverwrite": false` is set there.
 
 Always show the user the **drive path** (e.g. `Z:\Projects\Plan.docx`) when available, otherwise the UNC path,
 so they can open the file themselves.
