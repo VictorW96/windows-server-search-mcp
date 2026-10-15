@@ -70,6 +70,14 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         $script:CfgFile = Join-Path $env:TEMP "wss-config-$Run\config.json"
         New-Item -ItemType Directory -Path (Split-Path $CfgFile) -Force | Out-Null
         @{ write = @{ enabled = $true; allowOverwrite = $true; logPath = $WriteLog } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $CfgFile -Encoding UTF8
+        # A file with its own (protected) permissions: overwriting it through the share must be refused,
+        # because the share grants only "Change" and the permissions could not be carried over.
+        $script:Restricted = Join-Path $Env.Folder "$UploadRel\restricted\r.txt"
+        New-Item -ItemType Directory -Path (Split-Path $Restricted) -Force | Out-Null
+        Set-Content -LiteralPath $Restricted -Value 'original'
+        $acl = Get-Acl -LiteralPath $Restricted
+        $acl.SetAccessRuleProtection($true, $true)   # same access, but no longer inherited
+        Set-Acl -LiteralPath $Restricted -AclObject $acl
         $script:Msgs = @(Invoke-Mcp $Exe @(
                 (Call 1 'list_servers' @{ check = $true }),
                 (Call 2 'search_files' @{ query = $Env.Token }),
@@ -100,7 +108,8 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
                 (Call 27 'save_file' @{ destination = "$($Env.Drive)\$UploadRel"; source_path = 'C:\Windows\win.ini' }),
                 (Call 28 'save_file' @{ destination = 'C:\Temp'; name = 'x.txt'; content = 'x' }),
                 '{"jsonrpc":"2.0","id":29,"method":"tools/list"}',
-                (Call 30 'copy_file' @{ path = "$($Env.Drive)\alpha.txt"; destination = (Join-Path $env:APPDATA 'wss-should-not-exist') })
+                (Call 30 'copy_file' @{ path = "$($Env.Drive)\alpha.txt"; destination = (Join-Path $env:APPDATA 'wss-should-not-exist') }),
+                (Call 31 'save_file' @{ destination = "$($Env.Drive)\$UploadRel\restricted"; name = 'r.txt'; content = 'new'; overwrite = $true })
             ) @{ WSS_CONFIG_FILE = $CfgFile })
     }
 
@@ -284,6 +293,15 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         Test-Path (Join-Path $Env.Folder "$UploadRel\evil.exe") | Should -BeFalse
         Test-Path (Join-Path $Env.Folder 'secret\x.txt') | Should -BeFalse
         (Get-Content -LiteralPath (Join-Path $Env.Folder '.claude-policy') -Raw) | Should -Match 'secret/'
+    }
+
+    It 'refuses to overwrite a file whose own permissions cannot be kept' {
+        $m = $Msgs | Where-Object id -eq 31
+        $m.result.isError | Should -BeTrue
+        $m.result.content[0].text | Should -Match 'own permissions'
+        (Get-Content -LiteralPath $Restricted -Raw).Trim() | Should -Be 'original'
+        @(Get-ChildItem -LiteralPath (Split-Path $Restricted) -Force).Count | Should -Be 1 -Because 'no backup or temp file is left behind'
+        (Get-Acl -LiteralPath $Restricted).AreAccessRulesProtected | Should -BeTrue
     }
 
     It 'logs every write' {

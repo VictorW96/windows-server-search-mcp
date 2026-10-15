@@ -1700,6 +1700,19 @@ function Resolve-WssSaveSource {
     return $full
 }
 
+function Test-WssOwnPermissions {
+    <# True if a file has explicit or protected (non-inherited) permissions; also when they can't be read (fail closed). #>
+    param([string]$Path)
+    if (-not (Test-WssIsWindows)) { return $false }
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if ($acl.AreAccessRulesProtected) { return $true }
+        return (@($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])).Count -gt 0)
+    } catch {
+        return $true
+    }
+}
+
 function Save-WssOneFile {
     <#
       Writes one file into TargetDir: via a hidden temp file + rename (no partial files).
@@ -1741,10 +1754,25 @@ function Save-WssOneFile {
                 # ReplaceFile: the new content takes over the replaced file's ACL, attributes and streams, and the
                 # previous version is renamed to the backup, so it keeps its own ACL. Copy + delete + move would give
                 # both files the folder's inherited permissions instead. Fails rather than drop the ACL.
+                $replaceError = $null
                 try { [IO.File]::Replace($tmp, $target, $backup, $false) } catch {
                     # restore the previous version if it was already renamed to the backup
                     if (-not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $backup)) { try { [IO.File]::Move($backup, $target) } catch { } }
-                    throw
+                    if (-not (Test-Path -LiteralPath $target) -or -not (Test-Path -LiteralPath $tmp)) { throw }
+                    $replaceError = $_.Exception.Message
+                }
+                if ($replaceError) {
+                    # ReplaceFile also needs the right to change permissions, which shares granting only "Change" lack.
+                    # Without own permissions on the file, rename + move is equivalent: the backup keeps the file's
+                    # inherited permissions and the new version inherits the same ones.
+                    if (Test-WssOwnPermissions $target) {
+                        throw "'$Name' has its own permissions, which can't be carried over to the new version here ($replaceError). Save it under a new name instead (overwrite=false)."
+                    }
+                    [IO.File]::Move($target, $backup)
+                    try { [IO.File]::Move($tmp, $target) } catch {
+                        try { [IO.File]::Move($backup, $target) } catch { }
+                        throw
+                    }
                 }
             } else {
                 $target = Get-WssUniquePath $TargetDir $Name

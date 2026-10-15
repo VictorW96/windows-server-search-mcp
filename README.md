@@ -75,7 +75,9 @@ To restrict this:
   - an existing file gets a numbered copy (`report (1).docx`);
   - `overwrite: true` replaces it (unless `allowOverwrite` is `false`), and the previous version is kept
     as `report.docx.claude-backup-<yyyyMMdd-HHmmss>` (the save's date and time). The new version and the
-    backup both keep the original file's NTFS permissions.
+    backup both keep the original file's NTFS permissions. If the file has its own (non-inherited)
+    permissions and the share doesn't allow carrying them over (share permission "Change" instead of
+    "Full Control"), the overwrite is refused rather than leaving the content more widely readable.
 - **No half-written files:** content goes to a hidden temp file in the target folder and is then renamed.
 - **Audit log:** each write is a JSON line (time, user, computer, source, target, size, overwritten, backup)
   in `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl`, or in `logPath`, which may be a central
