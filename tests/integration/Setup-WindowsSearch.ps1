@@ -146,7 +146,7 @@ while ($true) {
 # --- 3. SMB share + mapped drive -----------------------------------------------
 Step "Sharing $Folder as \\$env:COMPUTERNAME\$ShareName"
 if (Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue) { Remove-SmbShare -Name $ShareName -Force }
-New-SmbShare -Name $ShareName -Path $Folder -ReadAccess 'Everyone' | Out-Null
+New-SmbShare -Name $ShareName -Path $Folder -ChangeAccess 'Everyone' | Out-Null  # change access: save_file tests write to it
 $unc = "\\$env:COMPUTERNAME\$ShareName"
 Step "Mapping ${DriveLetter}: -> $unc"
 cmd /c "net use ${DriveLetter}: /delete /y >nul 2>&1"

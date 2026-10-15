@@ -1754,7 +1754,10 @@ function Save-WssFiles {
                 $notes += "Write log could not be updated: $($_.Exception.Message)"
             }
         } catch {
-            [void]$errors.Add([ordered]@{ source = $job.Label; error = $_.Exception.Message })
+            $msg = $_.Exception.Message
+            $ex = $_.Exception
+            while ($ex) { if ($ex -is [UnauthorizedAccessException]) { $msg += ' You probably have no write permission for this server folder (share/NTFS permissions); ask the server administrator or choose another folder.'; break }; $ex = $ex.InnerException }
+            [void]$errors.Add([ordered]@{ source = $job.Label; error = $msg })
         }
     }
     if ($saved.Count -eq 0) {

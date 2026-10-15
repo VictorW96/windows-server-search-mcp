@@ -66,7 +66,9 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         $script:Run = [guid]::NewGuid().ToString('N').Substring(0, 6)
         $script:UploadRel = "uploads\run-$Run"
         $script:WriteLog = Join-Path $env:TEMP "wss-write-$Run.jsonl"
-        $script:CfgFile = Join-Path $env:TEMP "wss-config-$Run.json"
+        # own folder: copy_file refuses to write into the configuration folder (and its sub-folders)
+        $script:CfgFile = Join-Path $env:TEMP "wss-config-$Run\config.json"
+        New-Item -ItemType Directory -Path (Split-Path $CfgFile) -Force | Out-Null
         @{ write = @{ enabled = $true; allowOverwrite = $true; logPath = $WriteLog } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $CfgFile -Encoding UTF8
         $script:Msgs = @(Invoke-Mcp $Exe @(
                 (Call 1 'list_servers' @{ check = $true }),
@@ -298,7 +300,8 @@ Describe 'Write protection defaults' -Skip:$Skip {
     }
     It 'Group Policy DisableWrite overrides an enabled configuration' {
         $key = 'HKLM:\SOFTWARE\Policies\WindowsServerSearchMcp'
-        $cfg = Join-Path $env:TEMP 'wss-veto.json'
+        $cfg = Join-Path $env:TEMP 'wss-veto\config.json'
+        New-Item -ItemType Directory -Path (Split-Path $cfg) -Force | Out-Null
         '{"write":{"enabled":true}}' | Set-Content -LiteralPath $cfg
         New-ItemProperty -Path $key -Name DisableWrite -PropertyType DWord -Value 1 -Force | Out-Null
         try {
