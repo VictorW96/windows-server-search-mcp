@@ -156,7 +156,7 @@ if ($LASTEXITCODE -ne 0) { throw "net use failed with exit code $LASTEXITCODE" }
 # --- 4. Wait for indexing -------------------------------------------------------
 Step 'Waiting for the indexer'
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-$localSql = "SELECT System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:$($Folder -replace '\\','/')' AND CONTAINS(*, '`"$Token`"')"
+$localSql = "SELECT System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:$($Folder -replace '\\','/')' AND (CONTAINS(*, '`"$Token`"') OR System.FileName LIKE '%$Token%')"
 $found = 0
 while ((Get-Date) -lt $deadline) {
     $conn = New-Object -ComObject ADODB.Connection
@@ -168,10 +168,10 @@ while ((Get-Date) -lt $deadline) {
         $rs.Close()
     } catch { Write-Host "  query failed: $($_.Exception.Message)" } finally { try { $conn.Close() } catch { } }
     Write-Host ("  indexed items with token: {0} (catalog total {1})" -f $found, $(try { [WssSetup.Indexer]::Count() } catch { '?' }))
-    if ($found -ge 6) { break }
+    if ($found -ge 7) { break }  # 6 files with the token in their content + 1 with it only in the name
     Start-Sleep -Seconds 10
 }
-if ($found -lt 6) { throw "Indexer did not index the test files within $TimeoutSeconds s" }
+if ($found -lt 7) { throw "Indexer did not index the test files within $TimeoutSeconds s" }
 
 @{
     Token = $Token; Folder = $Folder; Share = $ShareName; Unc = $unc
