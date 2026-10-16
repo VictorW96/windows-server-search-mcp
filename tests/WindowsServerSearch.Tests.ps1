@@ -36,7 +36,7 @@ BeforeAll {
     function Get-TestSql { & $script:Mod { @($script:TestSql) } }
     function New-TestConfig {
         param($Servers = @(), $AutoDiscover = $true, $Exclude = @(), $MaxResults = 50, $Deny = @())
-        @{ Servers = @($Servers); AutoDiscover = $AutoDiscover; Exclude = @($Exclude); MaxResults = $MaxResults; QueryTimeout = 5; UseNetBios = $true; Deny = @($Deny); PolicyTtl = 0; MaxCopyMB = 500; WriteEnabled = $false; WriteAllowOverwrite = $false; WriteMaxMB = 100 }
+        @{ Servers = @($Servers); AutoDiscover = $AutoDiscover; Exclude = @($Exclude); MaxResults = $MaxResults; QueryTimeout = 5; UseNetBios = $true; Deny = @($Deny); PolicyTtl = 0; MaxCopyMB = 500; WriteEnabled = $false; WriteAllowOverwrite = $false; WriteBackup = $false; WriteAllowDelete = $false; WriteMaxMB = 100 }
     }
 }
 
@@ -945,10 +945,11 @@ Describe 'save_file' {
         Remove-Item $WBase -Recurse -Force -ErrorAction SilentlyContinue
         & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = $null }
     }
-    It 'is enabled by default (with overwrite) and hidden from tools/list when disabled' {
+    It 'is enabled by default (with overwrite, without backups) and hidden from tools/list when disabled' {
         $c = Get-WssConfig
         $c.WriteEnabled | Should -BeTrue
         $c.WriteAllowOverwrite | Should -BeTrue
+        $c.WriteBackup | Should -BeFalse
         @(Get-WssToolDefinitions | ForEach-Object { $_.name }) | Should -Not -Contain 'save_file'
         @(Get-WssToolDefinitions -IncludeWrite $true | ForEach-Object { $_.name }) | Should -Contain 'save_file'
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
@@ -956,13 +957,15 @@ Describe 'save_file' {
     }
     It 'can be enabled via the nested "write" object in the config file' {
         $f = Join-Path $WBase 'cfg.json'
-        '{"write":{"enabled":true,"allowOverwrite":true,"maxMB":5,"logPath":"C:\\log.jsonl"}}' | Set-Content -LiteralPath $f
+        '{"write":{"enabled":true,"allowOverwrite":true,"backup":true,"allowDelete":true,"maxMB":5,"logPath":"C:\\log.jsonl"}}' | Set-Content -LiteralPath $f
         $env:WSS_CONFIG_FILE = $f
         $env:WSS_WRITE_ENABLED = 'false'   # what the plugin default passes
         try {
             $c = Get-WssConfig
             $c.WriteEnabled | Should -BeTrue
             $c.WriteAllowOverwrite | Should -BeTrue
+            $c.WriteBackup | Should -BeTrue
+            $c.WriteAllowDelete | Should -BeTrue
             $c.WriteMaxMB | Should -Be 5
             $c.WriteLogPath | Should -Be 'C:\log.jsonl'
         } finally { Remove-Item env:WSS_CONFIG_FILE, env:WSS_WRITE_ENABLED -ErrorAction SilentlyContinue }
@@ -990,13 +993,22 @@ Describe 'save_file' {
         $r.renamed_to | Should -Be 'summary (1).md'
         [IO.File]::ReadAllText((Join-Path $d 'summary.md')) | Should -Be '# Grüße'
     }
-    It 'overwrites with a backup of the previous version' {
+    It 'overwrites with a backup of the previous version when backups are on' {
         $d = Join-Path $WBase 'out1'
-        $r = Save-WssOneFile -TargetDir $d -Name 'summary.md' -Content 'third' -Overwrite $true
+        $r = Save-WssOneFile -TargetDir $d -Name 'summary.md' -Content 'third' -Overwrite $true -KeepBackup $true
         $r.overwritten | Should -BeTrue
         [IO.File]::ReadAllText($r.target) | Should -Be 'third'
-        $r.backup | Should -Match 'summary\.md\.claude-backup-\d{8}-\d{6}$'
+        $r.backup | Should -Match 'summary\.md\.backup-\d{8}-\d{6}$'
         [IO.File]::ReadAllText($r.backup) | Should -Be '# Grüße'
+    }
+    It 'overwrites without leaving a backup or temp file by default' {
+        $d = Join-Path $WBase 'out3'
+        Save-WssOneFile -TargetDir $d -Name 'plain.txt' -Content 'one' | Out-Null
+        $r = Save-WssOneFile -TargetDir $d -Name 'plain.txt' -Content 'two' -Overwrite $true
+        $r.overwritten | Should -BeTrue
+        $r.Contains('backup') | Should -BeFalse
+        [IO.File]::ReadAllText($r.target) | Should -Be 'two'
+        @(Get-ChildItem -LiteralPath $d -Force | ForEach-Object Name) | Should -Be @('plain.txt')
     }
     It 'keeps the original file permissions on the new version and on the backup' -Skip:(-not ($IsWindows -or $PSVersionTable.PSVersion.Major -lt 6)) {
         $d = Join-Path $WBase 'acl'
@@ -1010,7 +1022,7 @@ Describe 'save_file' {
         Set-Acl -LiteralPath $f -AclObject $acl
         $before = (Get-Acl -LiteralPath $f).GetSecurityDescriptorSddlForm('Access')
 
-        $r = Save-WssOneFile -TargetDir $d -Name 'restricted.txt' -Content 'new' -Overwrite $true
+        $r = Save-WssOneFile -TargetDir $d -Name 'restricted.txt' -Content 'new' -Overwrite $true -KeepBackup $true
         [IO.File]::ReadAllText($r.target) | Should -Be 'new'
         (Get-Acl -LiteralPath $r.target).GetSecurityDescriptorSddlForm('Access') | Should -Be $before
         (Get-Acl -LiteralPath $r.backup).GetSecurityDescriptorSddlForm('Access') | Should -Be $before
@@ -1081,6 +1093,77 @@ Describe 'save_file' {
         $r = Get-WssServerList -Arguments @{} -Config $cfg
         $r.write.enabled | Should -BeTrue
         $r.write.allow_overwrite | Should -BeTrue
+        $r.write.backup | Should -BeFalse
+        $r.write.allow_delete | Should -BeFalse
+    }
+}
+
+Describe 'delete_files' {
+    BeforeAll {
+        $script:DBase = Join-Path ([IO.Path]::GetTempPath()) "wss-delete-$([guid]::NewGuid())"
+        New-Item -ItemType Directory -Path $DBase -Force | Out-Null
+        & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = { $false } }
+    }
+    AfterAll {
+        Get-ChildItem -LiteralPath $DBase -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Attributes = 'Normal' } catch { } }
+        Remove-Item $DBase -Recurse -Force -ErrorAction SilentlyContinue
+        & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = $null }
+    }
+    It 'is off by default and listed only when writing and deleting are allowed' {
+        (Get-WssConfig).WriteAllowDelete | Should -BeFalse
+        @(Get-WssToolDefinitions -IncludeWrite $true | ForEach-Object { $_.name }) | Should -Not -Contain 'delete_files'
+        @(Get-WssToolDefinitions -IncludeWrite $true -IncludeDelete $true | ForEach-Object { $_.name }) | Should -Contain 'delete_files'
+        $cfg = New-TestConfig; $cfg.WriteAllowDelete = $true
+        (Get-WssWriteStatus $cfg).allow_delete | Should -BeFalse -Because 'writing is disabled'
+        $cfg.WriteEnabled = $true
+        (Get-WssWriteStatus $cfg).allow_delete | Should -BeTrue
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        $off = New-TestConfig; $off.WriteEnabled = $true
+        { Remove-WssFiles -Arguments @{ path = 'Z:\a.txt' } -Config $off } | Should -Throw '*allowDelete*'
+    }
+    It 'Group Policy veto disables deleting' {
+        & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = { $true } }
+        try {
+            $cfg = New-TestConfig; $cfg.WriteEnabled = $true; $cfg.WriteAllowDelete = $true
+            (Get-WssWriteStatus $cfg).allow_delete | Should -BeFalse
+            { Remove-WssFiles -Arguments @{ path = 'Z:\a.txt' } -Config $cfg } | Should -Throw '*Group Policy*'
+        } finally { & (Get-Module WindowsServerSearch) { $script:RegistryWriteVetoProvider = { $false } } }
+    }
+    It 'deletes a file, or renames it to a backup when backups are on' {
+        $d = Join-Path $DBase 'one'
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $d 'a.txt') -Value 'A'
+        Set-Content -LiteralPath (Join-Path $d 'b.txt') -Value 'B'
+        $r = Remove-WssOneFile -Path (Join-Path $d 'a.txt')
+        $r.Contains('backup') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $d 'a.txt') | Should -BeFalse
+        $r = Remove-WssOneFile -Path (Join-Path $d 'b.txt') -KeepBackup $true
+        $r.backup | Should -Match 'b\.txt\.backup-\d{8}-\d{6}$'
+        Test-Path -LiteralPath (Join-Path $d 'b.txt') | Should -BeFalse
+        (Get-Content -LiteralPath $r.backup) | Should -Be 'B'
+    }
+    It 'refuses folders, missing and read-only files' {
+        $d = Join-Path $DBase 'two'
+        New-Item -ItemType Directory -Path (Join-Path $d 'sub') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $d 'ro.txt') -Value 'R'
+        [IO.File]::SetAttributes((Join-Path $d 'ro.txt'), [IO.FileAttributes]::ReadOnly)
+        { Remove-WssOneFile -Path (Join-Path $d 'sub') } | Should -Throw '*folder*'
+        { Remove-WssOneFile -Path (Join-Path $d 'missing.txt') } | Should -Throw '*not found*'
+        { Remove-WssOneFile -Path (Join-Path $d 'ro.txt') } | Should -Throw '*read-only*'
+        Test-Path -LiteralPath (Join-Path $d 'ro.txt') | Should -BeTrue
+    }
+    It 'refuses blocked paths, policy files, programs, share roots and paths outside known shares' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' }) -Policies @{ '\\fs01\p' = @{ Status = 'ok'; Content = 'secret' } }
+        $cfg = New-TestConfig; $cfg.WriteEnabled = $true; $cfg.WriteAllowDelete = $true
+        $r = { Remove-WssFiles -Arguments @{ paths = @('Z:\secret\a.txt', 'Z:\.claude-policy', 'Z:\tool.exe', 'Z:\', 'C:\local\x.txt') } -Config $cfg }
+        $r | Should -Throw '*No file was deleted*'
+        try { & $r } catch { $msg = $_.Exception.Message }
+        $msg | Should -Match 'access policy'
+        $msg | Should -Match 'not allowed'
+        $msg | Should -Match 'share root'
+        $msg | Should -Match 'not a mapped drive'
+        { Remove-WssFiles -Arguments @{} -Config $cfg } | Should -Throw '*Provide path*'
+        { Remove-WssFiles -Arguments @{ paths = @(1..21 | ForEach-Object { "Z:\f$_.txt" }) } -Config $cfg } | Should -Throw '*At most 20*'
     }
 }
 

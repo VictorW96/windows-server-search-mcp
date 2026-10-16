@@ -62,14 +62,14 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         New-Item -ItemType Directory -Path $Workspace -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $Workspace $Marker) -Value ''
         $script:CopyDir = Join-Path $env:TEMP ("wss-copy-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
-        # Writing enabled through the (nested) config file, with overwrite + a dedicated log
+        # Writing enabled through the (nested) config file, with overwrite, backups, deleting + a dedicated log
         $script:Run = [guid]::NewGuid().ToString('N').Substring(0, 6)
         $script:UploadRel = "uploads\run-$Run"
         $script:WriteLog = Join-Path $env:TEMP "wss-write-$Run.jsonl"
         # own folder: copy_file refuses to write into the configuration folder (and its sub-folders)
         $script:CfgFile = Join-Path $env:TEMP "wss-config-$Run\config.json"
         New-Item -ItemType Directory -Path (Split-Path $CfgFile) -Force | Out-Null
-        @{ write = @{ enabled = $true; allowOverwrite = $true; logPath = $WriteLog } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $CfgFile -Encoding UTF8
+        @{ write = @{ enabled = $true; allowOverwrite = $true; backup = $true; allowDelete = $true; logPath = $WriteLog } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $CfgFile -Encoding UTF8
         # A file with its own (protected) permissions: overwriting it through the share must be refused,
         # because the share grants only "Change" and the permissions could not be carried over.
         $script:Restricted = Join-Path $Env.Folder "$UploadRel\restricted\r.txt"
@@ -109,7 +109,8 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
                 (Call 28 'save_file' @{ destination = 'C:\Temp'; name = 'x.txt'; content = 'x' }),
                 '{"jsonrpc":"2.0","id":29,"method":"tools/list"}',
                 (Call 30 'copy_file' @{ path = "$($Env.Drive)\alpha.txt"; destination = (Join-Path $env:APPDATA 'wss-should-not-exist') }),
-                (Call 31 'save_file' @{ destination = "$($Env.Drive)\$UploadRel\restricted"; name = 'r.txt'; content = 'new'; overwrite = $true })
+                (Call 31 'save_file' @{ destination = "$($Env.Drive)\$UploadRel\restricted"; name = 'r.txt'; content = 'new'; overwrite = $true }),
+                (Call 32 'delete_files' @{ paths = @("$($Env.Drive)\$UploadRel\sub\summary (1).md", "$($Env.Drive)\$UploadRel\sub", "$($Env.Drive)\secret\plan.txt", "$($Env.Drive)\.claude-policy") })
             ) @{ WSS_CONFIG_FILE = $CfgFile })
     }
 
@@ -246,9 +247,10 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         ($Msgs | Where-Object id -eq 19).result.isError | Should -BeTrue
     }
 
-    It 'lists save_file when writing is enabled' {
+    It 'lists save_file and delete_files when writing and deleting are enabled' {
         $t = ($Msgs | Where-Object id -eq 29).result.tools
         @($t.name) | Should -Contain 'save_file'
+        @($t.name) | Should -Contain 'delete_files'
         ($t | Where-Object name -eq 'save_file').annotations.destructiveHint | Should -BeTrue
         (Get-ToolJson ($Msgs | Where-Object id -eq 1)).write.enabled | Should -BeTrue
     }
@@ -271,7 +273,7 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         $r = Get-ToolJson ($Msgs | Where-Object id -eq 22)
         $r.saved[0].overwritten | Should -BeTrue
         Get-Content -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub\summary.md") -Raw | Should -Match 'third'
-        $backup = Get-ChildItem -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub") -Filter 'summary.md.claude-backup-*'
+        $backup = Get-ChildItem -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub") -Filter 'summary.md.backup-*'
         @($backup).Count | Should -Be 1
         Get-Content -LiteralPath $backup[0].FullName -Raw | Should -Match $Env.Token
         @(Get-ChildItem -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub") -Force -Filter '.~claude-upload-*').Count | Should -Be 0
@@ -304,10 +306,24 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         (Get-Acl -LiteralPath $Restricted).AreAccessRulesProtected | Should -BeTrue
     }
 
-    It 'logs every write' {
+    It 'deletes files (kept as backup here) and refuses folders, blocked paths and policy files' {
+        $r = Get-ToolJson ($Msgs | Where-Object id -eq 32)
+        @($r.deleted).Count | Should -Be 1 -Because ($r | ConvertTo-Json -Depth 5)
+        $r.deleted[0].drive_path | Should -Be "$($Env.Drive)\$UploadRel\sub\summary (1).md"
+        $r.deleted[0].backup | Should -Match 'summary \(1\)\.md\.backup-\d{8}-\d{6}$'
+        Test-Path -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub\summary (1).md") | Should -BeFalse
+        Get-Content -LiteralPath $r.deleted[0].backup -Raw | Should -Match 'second'
+        @($r.errors).Count | Should -Be 3
+        Test-Path -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub") -PathType Container | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $Env.Folder 'secret\plan.txt') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $Env.Folder '.claude-policy') | Should -BeTrue
+    }
+
+    It 'logs every write and deletion' {
         $lines = @(Get-Content -LiteralPath $WriteLog | ForEach-Object { $_ | ConvertFrom-Json })
-        $lines.Count | Should -Be 4
+        $lines.Count | Should -Be 5
         ($lines | Where-Object overwritten).Count | Should -Be 1
+        @($lines | Where-Object action -eq 'delete').Count | Should -Be 1
         $lines[0].user | Should -Match $env:USERNAME
     }
 
@@ -325,6 +341,7 @@ Describe 'Write protection defaults' -Skip:$Skip {
         '{}' | Set-Content -LiteralPath $empty
         $m = @(Invoke-Mcp $exe @('{"jsonrpc":"2.0","id":1,"method":"tools/list"}') @{ WSS_CONFIG_FILE = $empty })
         @(($m | Where-Object id -eq 1).result.tools.name) | Should -Contain 'save_file'
+        @(($m | Where-Object id -eq 1).result.tools.name) | Should -Not -Contain 'delete_files'
         ($m | Where-Object id -eq 1).result.tools | Where-Object name -eq 'save_file' | ForEach-Object { $_.annotations.destructiveHint | Should -BeTrue }
 
         $off = Join-Path $env:TEMP 'wss-off\config.json'
@@ -337,6 +354,25 @@ Describe 'Write protection defaults' -Skip:$Skip {
         @(($m | Where-Object id -eq 1).result.tools.name) | Should -Not -Contain 'save_file'
         ($m | Where-Object id -eq 2).result.content[0].text | Should -Match 'disabled'
         Test-Path (Join-Path $Env.Folder 'uploads\x.txt') | Should -BeFalse
+    }
+    It 'overwrites and deletes without leaving backups when backups are off (default)' {
+        $dir = 'uploads\nobackup-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+        New-Item -ItemType Directory -Path (Join-Path $Env.Folder $dir) -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Env.Folder "$dir\a.txt") -Value 'old'
+        Set-Content -LiteralPath (Join-Path $Env.Folder "$dir\b.txt") -Value 'gone'
+        $cfg = Join-Path $env:TEMP 'wss-delete\config.json'
+        New-Item -ItemType Directory -Path (Split-Path $cfg) -Force | Out-Null
+        '{"write":{"allowDelete":true}}' | Set-Content -LiteralPath $cfg
+        $m = @(Invoke-Mcp (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @(
+                '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                (Call 2 'save_file' @{ destination = "$($Env.Drive)\$dir"; name = 'a.txt'; content = 'new'; overwrite = $true }),
+                (Call 3 'delete_files' @{ path = "$($Env.Drive)\$dir\b.txt" })
+            ) @{ WSS_CONFIG_FILE = $cfg })
+        @(($m | Where-Object id -eq 1).result.tools.name) | Should -Contain 'delete_files'
+        (Get-ToolJson ($m | Where-Object id -eq 2)).saved[0].overwritten | Should -BeTrue
+        (Get-ToolJson ($m | Where-Object id -eq 3)).deleted[0].path | Should -BeLike '*\b.txt'
+        @(Get-ChildItem -LiteralPath (Join-Path $Env.Folder $dir) -Force | ForEach-Object Name) | Should -Be @('a.txt')
+        Get-Content -LiteralPath (Join-Path $Env.Folder "$dir\a.txt") -Raw | Should -Be 'new'
     }
     It 'Group Policy DisableWrite overrides the default' {
         $key = 'HKLM:\SOFTWARE\Policies\WindowsServerSearchMcp'

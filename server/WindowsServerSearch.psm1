@@ -179,7 +179,9 @@ function Get-WssConfig {
         WSS_DOWNLOAD_DIR     default local folder for copy_file
         WSS_MAX_COPY_MB      maximum size per copied file in MB (default 500)
         WSS_WRITE_ENABLED    true|false (default true) - save_file (write to servers)
-        WSS_WRITE_OVERWRITE  true|false (default true) - allow overwriting (old version kept as backup)
+        WSS_WRITE_OVERWRITE  true|false (default true) - allow overwriting
+        WSS_WRITE_BACKUP     true|false (default false) - keep the replaced/deleted version as <name>.backup-<timestamp>
+        WSS_WRITE_DELETE     true|false (default false) - delete_files (delete files on servers)
         WSS_WRITE_MAX_MB     maximum size per written file in MB (default 100)
         WSS_WRITE_LOG        write log path (default %LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl)
         WSS_USE_IFILTER      true|false (default true) - read PDF, .doc, .rtf, .msg ... through Windows filters
@@ -197,9 +199,9 @@ function Get-WssConfig {
         try {
             $obj = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
             foreach ($p in $obj.PSObject.Properties) { $file[$p.Name] = $p.Value }
-            # Nested "write": { "enabled", "allowOverwrite", "maxMB", "logPath" }
+            # Nested "write": { "enabled", "allowOverwrite", "backup", "allowDelete", "maxMB", "logPath" }
             if ($file['write'] -is [System.Management.Automation.PSCustomObject]) {
-                $map = @{ enabled = 'writeEnabled'; allowOverwrite = 'writeAllowOverwrite'; maxMB = 'writeMaxMB'; logPath = 'writeLogPath' }
+                $map = @{ enabled = 'writeEnabled'; allowOverwrite = 'writeAllowOverwrite'; backup = 'writeBackup'; allowDelete = 'writeAllowDelete'; maxMB = 'writeMaxMB'; logPath = 'writeLogPath' }
                 foreach ($p in $file['write'].PSObject.Properties) { if ($map.ContainsKey($p.Name)) { $file[$map[$p.Name]] = $p.Value } }
             }
         } catch {
@@ -249,6 +251,8 @@ function Get-WssConfig {
         MaxCopyMB      = ConvertTo-WssInt (Pick 'WSS_MAX_COPY_MB' 'maxCopyMB') 500 1 102400
         WriteEnabled   = ConvertTo-WssBool (Pick 'WSS_WRITE_ENABLED' 'writeEnabled') $true
         WriteAllowOverwrite = ConvertTo-WssBool (Pick 'WSS_WRITE_OVERWRITE' 'writeAllowOverwrite') $true
+        WriteBackup    = ConvertTo-WssBool (Pick 'WSS_WRITE_BACKUP' 'writeBackup') $false
+        WriteAllowDelete = ConvertTo-WssBool (Pick 'WSS_WRITE_DELETE' 'writeAllowDelete') $false
         WriteMaxMB     = ConvertTo-WssInt (Pick 'WSS_WRITE_MAX_MB' 'writeMaxMB') 100 1 102400
         WriteLogPath   = (Pick 'WSS_WRITE_LOG' 'writeLogPath')
         UseIFilter     = ConvertTo-WssBool (Pick 'WSS_USE_IFILTER' 'useIFilter') $true
@@ -2533,7 +2537,7 @@ function Copy-WssFiles {
 }
 
 # ---------------------------------------------------------------------------
-# Writing files back to the server (save_file) - enabled by default, can be disabled
+# Writing files back to the server (save_file, enabled by default) and deleting them (delete_files, off by default)
 # ---------------------------------------------------------------------------
 
 # Never writable, in addition to the access policy: policy files and executable / script types.
@@ -2567,6 +2571,8 @@ function Get-WssWriteStatus {
         configured               = [bool]$Config.WriteEnabled
         disabled_by_group_policy = $veto
         allow_overwrite          = [bool]$Config.WriteAllowOverwrite
+        backup                   = [bool]$Config.WriteBackup
+        allow_delete             = ([bool]$Config.WriteEnabled -and [bool]$Config.WriteAllowDelete -and -not $veto)
         max_file_mb              = $Config.WriteMaxMB
     }
 }
@@ -2651,16 +2657,22 @@ function Test-WssOwnPermissions {
     }
 }
 
+function Get-WssBackupPath {
+    <# Free name for the previous version of a file: "<name>.backup-<yyyyMMdd-HHmmss>". #>
+    param([string]$Dir, [string]$Name)
+    return (Get-WssUniquePath $Dir ($Name + '.backup-' + (Get-Date).ToString('yyyyMMdd-HHmmss')))
+}
+
 function Save-WssOneFile {
     <#
       Writes one file into TargetDir: via a hidden temp file + rename (no partial files).
-      Existing file: numbered copy unless Overwrite, in which case the old version is kept as
-      "<name>.claude-backup-<timestamp>" next to it (both keep the original file's permissions).
+      Existing file: numbered copy unless Overwrite, which replaces it. With KeepBackup the old version is kept as
+      "<name>.backup-<timestamp>" next to it (both keep the original file's permissions).
     #>
     param(
         [string]$TargetDir, [string]$Name,
         [string]$SourceFile, [string]$Content, [string]$Encoding = 'utf8',
-        [bool]$Overwrite = $false, [int64]$MaxBytes = 100MB
+        [bool]$Overwrite = $false, [bool]$KeepBackup = $false, [int64]$MaxBytes = 100MB
     )
     Test-WssFileName $Name
     if ($SourceFile) {
@@ -2685,31 +2697,42 @@ function Save-WssOneFile {
 
         $target = [IO.Path]::Combine($TargetDir, $Name)
         $backup = $null
+        $replaced = $false
         if (Test-Path -LiteralPath $target) {
             if (Test-Path -LiteralPath $target -PathType Container) { throw "a folder named '$Name' already exists." }
             if ($Overwrite) {
-                $backup = Get-WssUniquePath $TargetDir ($Name + '.claude-backup-' + (Get-Date).ToString('yyyyMMdd-HHmmss'))
+                if ($KeepBackup) { $backup = Get-WssBackupPath $TargetDir $Name }
+                # Without a backup the previous version is still moved aside first (hidden temp name) and only
+                # deleted once the new version is in place, so a failure never loses it.
+                $aside = $backup
+                if (-not $aside) { $aside = [IO.Path]::Combine($TargetDir, '.~claude-old-' + [guid]::NewGuid().ToString('N') + '.tmp') }
                 # ReplaceFile: the new content takes over the replaced file's ACL, attributes and streams, and the
-                # previous version is renamed to the backup, so it keeps its own ACL. Copy + delete + move would give
+                # previous version is renamed aside, so it keeps its own ACL. Copy + delete + move would give
                 # both files the folder's inherited permissions instead. Fails rather than drop the ACL.
                 $replaceError = $null
-                try { [IO.File]::Replace($tmp, $target, $backup, $false) } catch {
-                    # restore the previous version if it was already renamed to the backup
-                    if (-not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $backup)) { try { [IO.File]::Move($backup, $target) } catch { } }
+                try { [IO.File]::Replace($tmp, $target, $aside, $false) } catch {
+                    # restore the previous version if it was already renamed aside
+                    if (-not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $aside)) { try { [IO.File]::Move($aside, $target) } catch { } }
                     if (-not (Test-Path -LiteralPath $target) -or -not (Test-Path -LiteralPath $tmp)) { throw }
                     $replaceError = $_.Exception.Message
                 }
                 if ($replaceError) {
                     # ReplaceFile also needs the right to change permissions, which shares granting only "Change" lack.
-                    # Without own permissions on the file, rename + move is equivalent: the backup keeps the file's
+                    # Without own permissions on the file, rename + move is equivalent: the old version keeps the file's
                     # inherited permissions and the new version inherits the same ones.
                     if (Test-WssOwnPermissions $target) {
                         throw "'$Name' has its own permissions, which can't be carried over to the new version here ($replaceError). Save it under a new name instead (overwrite=false)."
                     }
-                    [IO.File]::Move($target, $backup)
+                    [IO.File]::Move($target, $aside)
                     try { [IO.File]::Move($tmp, $target) } catch {
-                        try { [IO.File]::Move($backup, $target) } catch { }
+                        try { [IO.File]::Move($aside, $target) } catch { }
                         throw
+                    }
+                }
+                $replaced = $true
+                if (-not $backup) {
+                    try { [IO.File]::SetAttributes($aside, [IO.FileAttributes]::Normal); [IO.File]::Delete($aside) } catch {
+                        Write-WssLog "Could not delete the replaced version '$aside': $($_.Exception.Message)"
                     }
                 }
             } else {
@@ -2721,7 +2744,7 @@ function Save-WssOneFile {
         }
         try { [IO.File]::SetAttributes($target, ([IO.File]::GetAttributes($target) -band (-bnot [IO.FileAttributes]::Hidden))) } catch { }
         if ($SourceFile) { try { [IO.File]::SetLastWriteTimeUtc($target, (Get-Item -LiteralPath $SourceFile).LastWriteTimeUtc) } catch { } }
-        $out = [ordered]@{ target = $target; size = [int64](Get-Item -LiteralPath $target -Force).Length; overwritten = [bool]$backup }
+        $out = [ordered]@{ target = $target; size = [int64](Get-Item -LiteralPath $target -Force).Length; overwritten = $replaced }
         if ($backup) { $out.backup = $backup }
         if ([IO.Path]::GetFileName($target) -ne $Name) { $out.renamed_to = [IO.Path]::GetFileName($target) }
         return $out
@@ -2814,7 +2837,7 @@ function Save-WssFiles {
             $targetUnc = $destUnc.TrimEnd('\') + '\' + $name
             Assert-WssWritable $targetUnc $policy $writeRules
             $encoding = 'utf8'; if ($Arguments.encoding) { $encoding = "$($Arguments.encoding)".ToLowerInvariant() }
-            $r = Save-WssOneFile -TargetDir $destUnc -Name $name -SourceFile $src -Content $job.Content -Encoding $encoding -Overwrite $overwrite -MaxBytes $maxBytes
+            $r = Save-WssOneFile -TargetDir $destUnc -Name $name -SourceFile $src -Content $job.Content -Encoding $encoding -Overwrite $overwrite -KeepBackup ([bool]$Config.WriteBackup) -MaxBytes $maxBytes
             # The final name (numbered copy) must be allowed as well.
             Assert-WssWritable $r.target $policy $writeRules
             $entry = [ordered]@{ source = $job.Label }
@@ -2825,7 +2848,7 @@ function Save-WssFiles {
             try {
                 $logPath = Write-WssWriteLog $Config ([ordered]@{
                         time = (Get-Date).ToUniversalTime().ToString('o'); user = "$env:USERDOMAIN\$env:USERNAME"; computer = $env:COMPUTERNAME
-                        source = $job.Label; target = $r.target; size = $r.size; overwritten = $r.overwritten; backup = $r.backup
+                        action = 'save'; source = $job.Label; target = $r.target; size = $r.size; overwritten = $r.overwritten; backup = $r.backup
                     })
             } catch {
                 $notes += "Write log could not be updated: $($_.Exception.Message)"
@@ -2844,6 +2867,84 @@ function Save-WssFiles {
     $dp = Convert-WssUncToDrivePath $destUnc $Targets
     if ($dp) { $out.destination_drive_path = $dp }
     $out.saved = @($saved)
+    if ($errors.Count -gt 0) { $out.errors = @($errors) }
+    if ($notes.Count -gt 0) { $out.notes = @($notes) }
+    if ($logPath) { $out.log = $logPath }
+    return $out
+}
+
+function Remove-WssOneFile {
+    <# Deletes one (already validated) file; with KeepBackup it is renamed to "<name>.backup-<timestamp>" instead. #>
+    param([string]$Path, [bool]$KeepBackup = $false)
+    if (Test-Path -LiteralPath $Path -PathType Container) { throw 'is a folder; only files can be deleted.' }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'file not found.' }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) { throw 'is read-only; it was not deleted.' }
+    $out = [ordered]@{ path = $item.FullName; size = [int64]$item.Length }
+    if ($KeepBackup) {
+        $backup = Get-WssBackupPath $item.DirectoryName $item.Name
+        [IO.File]::Move($item.FullName, $backup)
+        $out.backup = $backup
+    } else {
+        [IO.File]::Delete($item.FullName)
+    }
+    return $out
+}
+
+function Remove-WssFiles {
+    param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig), $Targets = $null)
+    $status = Get-WssWriteStatus $Config
+    if ($status.disabled_by_group_policy) { throw 'Deleting files on servers is disabled by Group Policy (DisableWrite).' }
+    if (-not $status.allow_delete) { throw 'Deleting files on servers is disabled in the plugin configuration (enable it with "write": { "allowDelete": true }).' }
+    if ($null -eq $Targets) { $Targets = @(Get-WssTargets -Config $Config) }
+
+    $paths = @()
+    if ($Arguments.path) { $paths += "$($Arguments.path)" }
+    if ($Arguments.paths) { foreach ($x in @($Arguments.paths)) { if ($x -and -not ($paths -contains "$x")) { $paths += "$x" } } }
+    if ($paths.Count -eq 0) { throw 'Provide path (one file) or paths (several files) to delete.' }
+    if ($paths.Count -gt 20) { throw 'At most 20 files can be deleted per call.' }
+
+    $policy = Get-WssPolicy -Config $Config -Targets $Targets
+    $writeRules = Get-WssWriteRules
+    $deleted = New-Object System.Collections.ArrayList
+    $errors = New-Object System.Collections.ArrayList
+    $notes = @()
+    $logPath = $null
+    foreach ($p in $paths) {
+        try {
+            $unc = Resolve-WssPath $p $Targets
+            if ((ConvertFrom-WssUncPath $unc).Rest -eq '') { throw 'is a share root, not a file.' }
+            Assert-WssWritable $unc $policy $writeRules
+            # The real file behind a client-side link must be deletable as well.
+            Assert-WssAllowed $unc $policy -CheckFinalPath
+            $final = Get-WssFinalPath $unc
+            if ($final -and $final -ine $unc) { Assert-WssWritable $final $policy $writeRules }
+            $r = Remove-WssOneFile -Path $unc -KeepBackup ([bool]$Config.WriteBackup)
+            $entry = [ordered]@{ path = $r.path }
+            $drivePath = Convert-WssUncToDrivePath $r.path $Targets
+            if ($drivePath) { $entry.drive_path = $drivePath }
+            $entry.size = $r.size
+            if ($r.backup) { $entry.backup = $r.backup }
+            [void]$deleted.Add($entry)
+            try {
+                $logPath = Write-WssWriteLog $Config ([ordered]@{
+                        time = (Get-Date).ToUniversalTime().ToString('o'); user = "$env:USERDOMAIN\$env:USERNAME"; computer = $env:COMPUTERNAME
+                        action = 'delete'; target = $r.path; size = $r.size; backup = $r.backup
+                    })
+            } catch {
+                $notes += "Write log could not be updated: $($_.Exception.Message)"
+            }
+        } catch {
+            $msg = $_.Exception.Message
+            $ex = $_.Exception
+            while ($ex) { if ($ex -is [UnauthorizedAccessException]) { $msg += ' You probably have no permission to delete this file (share/NTFS permissions); ask the server administrator.'; break }; $ex = $ex.InnerException }
+            [void]$errors.Add([ordered]@{ path = $p; error = $msg })
+        }
+    }
+    if ($deleted.Count -eq 0) {
+        throw ('No file was deleted: ' + (($errors | ForEach-Object { "$($_.path): $($_.error)" }) -join ' | '))
+    }
+    $out = [ordered]@{ deleted = @($deleted) }
     if ($errors.Count -gt 0) { $out.errors = @($errors) }
     if ($notes.Count -gt 0) { $out.notes = @($notes) }
     if ($logPath) { $out.log = $logPath }
@@ -2908,11 +3009,12 @@ function Get-WssOutputSchemas {
         list_directory = [ordered]@{ type = 'object'; properties = [ordered]@{ path = $str; drive_path = $str; entries = $arr; truncated = $bool; hidden_by_policy = $int }; required = @('path', 'entries') }
         copy_file      = [ordered]@{ type = 'object'; properties = [ordered]@{ destination = $str; destination_source = $str; copied = $arr; errors = $arr; note = $str }; required = @('copied') }
         save_file      = [ordered]@{ type = 'object'; properties = [ordered]@{ destination = $str; destination_drive_path = $str; saved = $arr; errors = $arr; notes = @{ type = 'array'; items = $str }; log = $str }; required = @('saved') }
+        delete_files   = [ordered]@{ type = 'object'; properties = [ordered]@{ deleted = $arr; errors = $arr; notes = @{ type = 'array'; items = $str }; log = $str }; required = @('deleted') }
     }
 }
 
 function Get-WssToolDefinitions {
-    param([bool]$IncludeWrite = $false, [bool]$AllowOverwrite = $false, [bool]$IncludeOutputSchema = $false)
+    param([bool]$IncludeWrite = $false, [bool]$AllowOverwrite = $false, [bool]$Backup = $false, [bool]$IncludeDelete = $false, [bool]$IncludeOutputSchema = $false)
     $serverProp = @{ type = 'string'; description = 'Restrict to one server (name as returned by list_servers). Default: all servers.' }
     $tools = @(
         [ordered]@{
@@ -3006,7 +3108,7 @@ function Get-WssToolDefinitions {
         [ordered]@{
             name        = 'save_file'
             title       = 'Save file to Windows server'
-            description = 'Writes files to a folder on a known Windows server share (UNC or mapped drive path; missing sub-folders are created). Sources: inline text "content" (+ "name"), or files from your Cowork workspace via source_marker (the marker file in your workspace folder, see copy_file) + source_name/source_names. Existing files are kept and a numbered copy is created unless overwrite=true' + $(if ($AllowOverwrite) { ' (the previous version is then kept as <name>.claude-backup-<timestamp>).' } else { '; overwriting is disabled by configuration.' }) + ' Blocked paths, policy files and executable/script types cannot be written. Every write is logged. Only save when the user asked for it.'
+            description = 'Writes files to a folder on a known Windows server share (UNC or mapped drive path; missing sub-folders are created). Sources: inline text "content" (+ "name"), or files from your Cowork workspace via source_marker (the marker file in your workspace folder, see copy_file) + source_name/source_names. Existing files are kept and a numbered copy is created unless overwrite=true' + $(if (-not $AllowOverwrite) { '; overwriting is disabled by configuration.' } elseif ($Backup) { ' (the previous version is then kept as <name>.backup-<timestamp>).' } else { ' (the previous version is then replaced without a backup).' }) + ' Blocked paths, policy files and executable/script types cannot be written. Every write is logged. Only save when the user asked for it.'
             inputSchema = [ordered]@{
                 type       = 'object'
                 properties = [ordered]@{
@@ -3018,11 +3120,24 @@ function Get-WssToolDefinitions {
                     source_name   = @{ type = 'string'; description = 'File in the workspace folder to upload, relative to the marker''s folder (e.g. report.docx or out/chart.png).' }
                     source_names  = @{ type = 'array'; items = @{ type = 'string' }; maxItems = 20; description = 'Several workspace files to upload.' }
                     source_path   = @{ type = 'string'; description = 'Absolute local Windows path of a file inside the workspace or download folder.' }
-                    overwrite     = @{ type = 'boolean'; default = $false; description = 'Replace an existing file with the same name (keeps a backup of the old version).' }
+                    overwrite     = @{ type = 'boolean'; default = $false; description = $(if ($Backup) { 'Replace an existing file with the same name (keeps a backup of the old version).' } else { 'Replace an existing file with the same name (no backup of the old version is kept).' }) }
                 }
                 required   = @('destination')
             }
             annotations = @{ readOnlyHint = $false; destructiveHint = $AllowOverwrite; idempotentHint = $false; openWorldHint = $false }
+        }) } else { @() }) + $(if ($IncludeDelete) { @(
+        [ordered]@{
+            name        = 'delete_files'
+            title       = 'Delete files on Windows server'
+            description = 'Deletes files (not folders) on a known Windows server share (UNC or mapped drive paths, up to 20 per call)' + $(if ($Backup) { '; each file is kept as <name>.backup-<timestamp> instead of being removed.' } else { '. Deleted files are gone: shares have no recycle bin and no backup is kept.' }) + ' Blocked paths, policy files, executable/script types and read-only files cannot be deleted. Every deletion is logged. Only delete when the user explicitly asked for these files to be deleted.'
+            inputSchema = [ordered]@{
+                type       = 'object'
+                properties = [ordered]@{
+                    path  = @{ type = 'string'; description = 'File to delete: Z:\Reports\old.docx or \\server\share\Reports\old.docx.' }
+                    paths = @{ type = 'array'; items = @{ type = 'string' }; maxItems = 20; description = 'Several files to delete.' }
+                }
+            }
+            annotations = @{ readOnlyHint = $false; destructiveHint = $true; idempotentHint = $true; openWorldHint = $false }
         }) } else { @() })
     if ($IncludeOutputSchema) {
         $schemas = Get-WssOutputSchemas
@@ -3063,6 +3178,7 @@ function Invoke-WssTool {
         'list_directory' { return Get-WssDirectoryListing -Arguments $Arguments }
         'copy_file' { return Copy-WssFiles -Arguments $Arguments }
         'save_file' { return Save-WssFiles -Arguments $Arguments }
+        'delete_files' { return Remove-WssFiles -Arguments $Arguments }
         default { throw [System.Collections.Generic.KeyNotFoundException]::new("Unknown tool: $Name") }
     }
 }
@@ -3109,11 +3225,11 @@ function Invoke-WssRequest {
         'tools/list' {
             $cfg = Get-WssConfig
             $ws = Get-WssWriteStatus $cfg
-            return New-WssResponse $id ([ordered]@{ tools = @(Get-WssToolDefinitions -IncludeWrite $ws.enabled -AllowOverwrite $ws.allow_overwrite -IncludeOutputSchema (Test-WssStructuredOutput)) })
+            return New-WssResponse $id ([ordered]@{ tools = @(Get-WssToolDefinitions -IncludeWrite $ws.enabled -AllowOverwrite $ws.allow_overwrite -Backup $ws.backup -IncludeDelete $ws.allow_delete -IncludeOutputSchema (Test-WssStructuredOutput)) })
         }
         'tools/call' {
             $name = $params.name
-            $known = @(Get-WssToolDefinitions -IncludeWrite $true | ForEach-Object { $_.name })
+            $known = @(Get-WssToolDefinitions -IncludeWrite $true -IncludeDelete $true | ForEach-Object { $_.name })
             if ($known -notcontains $name) { return New-WssError $id -32602 "Unknown tool: $name" }
             $toolArgs = $params.arguments
             if ($null -eq $toolArgs) { $toolArgs = @{} }

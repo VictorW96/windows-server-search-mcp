@@ -73,8 +73,22 @@
     "allow_overwrite": {
       "type": "boolean",
       "title": "Allow overwriting files",
-      "description": "Let save_file replace existing files when asked (overwrite: true); the previous version is always kept as <name>.claude-backup-<timestamp>. On by default; disable with \"write\": {\"allowOverwrite\": false} in the config file.",
+      "description": "Let save_file replace existing files when asked (overwrite: true). On by default; disable with \"write\": {\"allowOverwrite\": false} in the config file.",
       "default": true,
+      "required": false
+    },
+    "keep_backups": {
+      "type": "boolean",
+      "title": "Keep backups of replaced and deleted files",
+      "description": "Keep the previous version of a file that save_file replaces or delete_files deletes as <name>.backup-<timestamp> next to it. Off by default; in Cowork enable it with \"write\": {\"backup\": true} in the config file.",
+      "default": false,
+      "required": false
+    },
+    "allow_delete": {
+      "type": "boolean",
+      "title": "Allow deleting files",
+      "description": "Let Claude delete files on the shares with the delete_files tool (never blocked paths, folders or programs/scripts; needs writing to be allowed). Off by default; in Cowork enable it with \"write\": {\"allowDelete\": true} in the config file.",
+      "default": false,
       "required": false
     }
   }

@@ -54,13 +54,21 @@ The `windows-server-search` MCP server queries the **Windows Search index of the
    or files from your workspace (`source_marker` + `source_name(s)`) into a server folder (`destination`).
    - Only save when the user asked you to, and tell them the exact path you saved to.
    - Existing files are never replaced unless you pass `overwrite: true` (only if the user wants the file
-     replaced); the old version is then kept as `<name>.claude-backup-<timestamp>`. Otherwise a numbered copy
-     is created – mention the new name.
+     replaced). Whether the old version is kept as `<name>.backup-<timestamp>` depends on the configuration
+     (`write.backup` in `list_servers`); without it the old version is gone, so tell the user before you
+     overwrite. Otherwise a numbered copy is created – mention the new name.
    - Blocked paths, `.claude-policy` files and programs/scripts (`.exe`, `.ps1`, …) can't be written.
    - Hidden files and files in dot folders (`.env`, `.ssh\…`) can't be uploaded.
    - If the tool is missing, writing was disabled by the user (`"write": { "enabled": false }` in
      `%APPDATA%\windows-server-search-mcp\config.json`) or by IT (Group Policy). If replacing files is refused,
      `"allowOverwrite": false` is set there.
+
+7. **`delete_files`** – only available when the user turned deleting on (`"allowDelete": true`). Deletes
+   files (`path` or `paths`), never folders.
+   - Only delete files the user explicitly asked you to delete, and confirm the exact list first.
+   - Without backups (`write.backup` false in `list_servers`) deleted files are gone for good; shares have no
+     recycle bin. With backups they are renamed to `<name>.backup-<timestamp>`.
+   - Report what was deleted (drive path) and any `errors` (read-only files, blocked paths, missing permissions).
 
 Always show the user the **drive path** (e.g. `Z:\Projects\Plan.docx`) when available, otherwise the UNC path,
 so they can open the file themselves.

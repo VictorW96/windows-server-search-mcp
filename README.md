@@ -48,7 +48,8 @@ without one they mean the local time of the PC, and a plain date covers that who
 For clients on MCP protocol 2025-06-18 or newer, every tool declares an `outputSchema` and returns its result as
 `structuredContent` as well as JSON text.
 
-| `save_file` | Saves text (`content`) or workspace files to a server folder (on by default, can be disabled). No delete, move or rename |
+| `save_file` | Saves text (`content`) or workspace files to a server folder (on by default, can be disabled). No move or rename |
+| `delete_files` | Deletes files on a server (off by default, enable with `allowDelete`) |
 
 ### Reading files
 
@@ -72,23 +73,25 @@ For clients on MCP protocol 2025-06-18 or newer, every tool declares an `outputS
 `a OR b` finds either. Each passage has the matching line(s) plus `context` lines around them, its line
 number, and its `offset`, which `read_file` accepts to read on from there.
 
-### Writing to servers (`save_file`, on by default)
+### Writing to servers (`save_file`, on by default; `delete_files`, off by default)
 
 Writing and overwriting are **enabled by default**. Claude can save files to every known share except
-blocked paths. When it replaces a file (`overwrite: true`), the previous version is always kept as a backup.
-To restrict this:
+blocked paths. When it replaces a file (`overwrite: true`), no backup is kept unless you turn on
+`backup`. Deleting files (`delete_files`) is **off by default**. To change this:
 
 ```json
-// %APPDATA%\windows-server-search-mcp\config.json  (Cowork)  – or plugin options allow_write / allow_overwrite (Claude Code)
+// %APPDATA%\windows-server-search-mcp\config.json  (Cowork)  – or plugin options allow_write / allow_overwrite /
+// keep_backups / allow_delete (Claude Code)
 { "write": { "enabled": false } }   // either: turn writing off completely
 { "write": { "allowOverwrite": false, "maxMB": 100, "logPath": "\\\\fs01\\it\\claude-writes.jsonl" } } // or: never replace files + central log
+{ "write": { "backup": true, "allowDelete": true } } // or: keep backups of replaced/deleted files + allow deleting
 ```
 
 - **Group Policy veto:** `DisableWrite = 1` (DWORD) under `HKLM\SOFTWARE\Policies\WindowsServerSearchMcp`
-  (or HKCU) turns writing off whatever the user configured. The tool then disappears.
-- **Disabled means hidden:** the tool isn't listed at all while writing is disabled. A change takes
-  effect in the next session.
-- **Never writable:**
+  (or HKCU) turns writing and deleting off whatever the user configured. The tools then disappear.
+- **Disabled means hidden:** `save_file` isn't listed at all while writing is disabled, `delete_files`
+  only while writing *and* `allowDelete` are on. A change takes effect in the next session.
+- **Never writable or deletable:**
   - blocked paths from the access policy;
   - `.claude-policy` files;
   - programs and scripts (`.exe .dll .com .scr .msi .bat .cmd .ps1 .vbs .js .hta .lnk .url .reg .jar` …),
@@ -104,13 +107,17 @@ To restrict this:
   (`*.kdbx`, `*.pfx`, …), even when renamed.
 - **No silent overwrites:**
   - an existing file gets a numbered copy (`report (1).docx`);
-  - `overwrite: true` replaces it (unless `allowOverwrite` is `false`), and the previous version is kept
-    as `report.docx.claude-backup-<yyyyMMdd-HHmmss>` (the save's date and time). The new version and the
-    backup both keep the original file's NTFS permissions. If the file has its own (non-inherited)
+  - `overwrite: true` replaces it (unless `allowOverwrite` is `false`). With `backup: true` the previous
+    version is kept as `report.docx.backup-<yyyyMMdd-HHmmss>` (the save's date and time); otherwise it is
+    removed once the new version is in place. The new version (and the backup) keep the original file's
+    NTFS permissions. If the file has its own (non-inherited)
     permissions and the share doesn't allow carrying them over (share permission "Change" instead of
     "Full Control"), the overwrite is refused rather than leaving the content more widely readable.
 - **No half-written files:** content goes to a hidden temp file in the target folder and is then renamed.
-- **Audit log:** each write is a JSON line (time, user, computer, source, target, size, overwritten, backup)
+- **Deleting (`delete_files`, off by default):** files only, never folders or share roots, up to 20 per
+  call. Read-only files are refused. With `backup: true` a "deleted" file is renamed to
+  `<name>.backup-<yyyyMMdd-HHmmss>` instead; otherwise it is gone (SMB shares have no recycle bin).
+- **Audit log:** each write or deletion is a JSON line (time, user, computer, action, source, target, size, overwritten, backup)
   in `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl`, or in `logPath`, which may be a central
   share.
 - **NTFS permissions apply:** files are written with the user's own Windows permissions, just like Explorer.
@@ -237,7 +244,9 @@ All settings are optional. A PC with mapped network drives works without any con
 | Download folder | `downloadDir` / `WSS_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads\Windows Server Search` | Default destination for `copy_file` |
 | – | `maxCopyMB` / `WSS_MAX_COPY_MB` | `500` | Maximum size per copied file |
 | Allow writing to servers | `write.enabled` / `WSS_WRITE_ENABLED` | `true` | `save_file`; set `false` to disable |
-| Allow overwriting files | `write.allowOverwrite` / `WSS_WRITE_OVERWRITE` | `true` | `overwrite: true` replaces files (with backup); `false` = numbered copies only |
+| Allow overwriting files | `write.allowOverwrite` / `WSS_WRITE_OVERWRITE` | `true` | `overwrite: true` replaces files; `false` = numbered copies only |
+| Keep backups of replaced and deleted files | `write.backup` / `WSS_WRITE_BACKUP` | `false` | Keep the previous version as `<name>.backup-<timestamp>` when a file is replaced or deleted |
+| Allow deleting files | `write.allowDelete` / `WSS_WRITE_DELETE` | `false` | `delete_files`; needs writing to be allowed |
 | – | `write.maxMB` / `WSS_WRITE_MAX_MB` | `100` | Maximum size per written file |
 | – | `write.logPath` / `WSS_WRITE_LOG` | `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl` | Write audit log |
 | – | `queryTimeout` / `WSS_QUERY_TIMEOUT` | `30` | Seconds per index query. Several servers are queried in parallel |
