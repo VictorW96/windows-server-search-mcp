@@ -78,6 +78,8 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
         $acl = Get-Acl -LiteralPath $Restricted
         $acl.SetAccessRuleProtection($true, $true)   # same access, but no longer inherited
         Set-Acl -LiteralPath $Restricted -AclObject $acl
+        # deleted by call 32 (kept as a backup, the config turns backups on)
+        Set-Content -LiteralPath (Join-Path $Env.Folder "$UploadRel\todelete.txt") -Value 'delete me'
         $script:Msgs = @(Invoke-Mcp $Exe @(
                 (Call 1 'list_servers' @{ check = $true }),
                 (Call 2 'search_files' @{ query = $Env.Token }),
@@ -110,7 +112,7 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
                 '{"jsonrpc":"2.0","id":29,"method":"tools/list"}',
                 (Call 30 'copy_file' @{ path = "$($Env.Drive)\alpha.txt"; destination = (Join-Path $env:APPDATA 'wss-should-not-exist') }),
                 (Call 31 'save_file' @{ destination = "$($Env.Drive)\$UploadRel\restricted"; name = 'r.txt'; content = 'new'; overwrite = $true }),
-                (Call 32 'delete_files' @{ paths = @("$($Env.Drive)\$UploadRel\sub\summary (1).md", "$($Env.Drive)\$UploadRel\sub", "$($Env.Drive)\secret\plan.txt", "$($Env.Drive)\.claude-policy") })
+                (Call 32 'delete_files' @{ paths = @("$($Env.Drive)\$UploadRel\todelete.txt", "$($Env.Drive)\$UploadRel\sub", "$($Env.Drive)\secret\plan.txt", "$($Env.Drive)\.claude-policy") })
             ) @{ WSS_CONFIG_FILE = $CfgFile })
     }
 
@@ -309,10 +311,10 @@ Describe 'Windows Search integration on <Name>' -Skip:$Skip -ForEach $Hosts {
     It 'deletes files (kept as backup here) and refuses folders, blocked paths and policy files' {
         $r = Get-ToolJson ($Msgs | Where-Object id -eq 32)
         @($r.deleted).Count | Should -Be 1 -Because ($r | ConvertTo-Json -Depth 5)
-        $r.deleted[0].drive_path | Should -Be "$($Env.Drive)\$UploadRel\sub\summary (1).md"
-        $r.deleted[0].backup | Should -Match 'summary \(1\)\.md\.backup-\d{8}-\d{6}$'
-        Test-Path -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub\summary (1).md") | Should -BeFalse
-        Get-Content -LiteralPath $r.deleted[0].backup -Raw | Should -Match 'second'
+        $r.deleted[0].drive_path | Should -Be "$($Env.Drive)\$UploadRel\todelete.txt"
+        $r.deleted[0].backup | Should -Match 'todelete\.txt\.backup-\d{8}-\d{6}$'
+        Test-Path -LiteralPath (Join-Path $Env.Folder "$UploadRel\todelete.txt") | Should -BeFalse
+        Get-Content -LiteralPath $r.deleted[0].backup -Raw | Should -Match 'delete me'
         @($r.errors).Count | Should -Be 3
         Test-Path -LiteralPath (Join-Path $Env.Folder "$UploadRel\sub") -PathType Container | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $Env.Folder 'secret\plan.txt') | Should -BeTrue
