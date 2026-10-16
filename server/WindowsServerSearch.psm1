@@ -25,6 +25,16 @@ $script:ResultColumns = @(
     'System.Kind',
     'System.Search.Rank'
 )
+# Fallback for clients that fail with "class not registered" on some servers: only basic columns.
+$script:BasicColumns = @(
+    'System.ItemUrl',
+    'System.ItemPathDisplay',
+    'System.FileName',
+    'System.Size',
+    'System.DateModified'
+)
+$script:MaxCompatLevel = 3
+$script:CompatLevel = @{}
 
 # ---------------------------------------------------------------------------
 # Logging (stderr only - stdout is reserved for JSON-RPC)
@@ -436,7 +446,9 @@ function New-WssSearchSql {
         [string]$ModifiedBefore,
         [bool]$IncludeFolders = $false,
         [ValidateSet('relevance', 'modified', 'name', 'size')][string]$Sort = 'relevance',
-        [int]$Top = 50
+        [int]$Top = 50,
+        # 0 = full query; 1 = basic columns; 2 = also no rank ordering; 3 = also no ORDER BY at all.
+        [int]$Compat = 0
     )
     $where = New-Object System.Collections.ArrayList
 
@@ -493,11 +505,14 @@ function New-WssSearchSql {
         'size' { $order = 'System.Size DESC' }
         default { if ($hasText) { $order = 'System.Search.Rank DESC' } else { $order = 'System.DateModified DESC' } }
     }
+    if ($Compat -ge 2 -and $order -like 'System.Search.Rank*') { $order = 'System.DateModified DESC' }
+    $columns = $script:ResultColumns
+    if ($Compat -ge 1) { $columns = $script:BasicColumns }
 
     if ($Machine -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid server name '$Machine'" }
-    $sql = "SELECT TOP $Top " + ($script:ResultColumns -join ', ') + " FROM $Machine.SystemIndex"
+    $sql = "SELECT TOP $Top " + ($columns -join ', ') + " FROM $Machine.SystemIndex"
     if ($where.Count -gt 0) { $sql += ' WHERE ' + ($where -join ' AND ') }
-    $sql += " ORDER BY $order"
+    if ($Compat -lt 3) { $sql += " ORDER BY $order" }
     return $sql
 }
 
@@ -531,6 +546,35 @@ function Invoke-WssQuery {
         if ($rs) { try { if ($rs.State -ne 0) { $rs.Close() } } catch { }; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($rs) }
         try { if ($conn.State -ne 0) { $conn.Close() } } catch { }
         [void][Runtime.InteropServices.Marshal]::ReleaseComObject($conn)
+    }
+}
+
+function Test-WssClassNotRegistered {
+    param($Exception)
+    $code = Get-WssErrorCode $Exception
+    return ($code -in @('0x80040154', '0x800401F3')) -or ("$($Exception.Message)" -match 'class not registered|Klasse nicht registriert')
+}
+
+function Invoke-WssCompatQuery {
+    <# Runs an index query built by $BuildSql (receives the compat level). If the client reports "class not
+       registered" - seen for single servers while others work in the same process - it retries with simpler
+       SQL. The level that worked is remembered per server so later searches skip the failing variants. #>
+    param([string]$Machine, [scriptblock]$BuildSql, [int]$TimeoutSeconds = 30)
+    $level = 0
+    if ($script:CompatLevel.ContainsKey($Machine)) { $level = $script:CompatLevel[$Machine] }
+    while ($true) {
+        $sql = & $BuildSql $level
+        Write-WssLog "Query [$Machine]: $sql"
+        try {
+            $rows = @(Invoke-WssQuery -Machine $Machine -Sql $sql -TimeoutSeconds $TimeoutSeconds)
+        } catch {
+            if ($level -ge $script:MaxCompatLevel -or -not (Test-WssClassNotRegistered $_.Exception)) { throw }
+            $level++
+            Write-WssLog "Query [$Machine] failed with 'class not registered'; retrying with simpler SQL (level $level)"
+            continue
+        }
+        $script:CompatLevel[$Machine] = $level
+        return $rows
     }
 }
 
@@ -642,7 +686,9 @@ function Get-WssErrorMessage {
             "Hint: access denied. The current Windows user may not query the search index on '$Machine'; this is a permission problem, not a missing search service."; break
         }
         '0x80040154|0x800401F3|class not registered|Klasse nicht registriert' {
-            "Hint: the Windows Search query component (Search.CollatorDSO / ADODB) is not available on this PC. The problem is on this PC, not on the file server."; break
+            $bits = ''
+            if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $bits = ' This MCP server runs as a 32-bit PowerShell process.' }
+            "Hint: this PC could not run the index query for '$Machine' because a COM class is not registered here (Search.CollatorDSO / ADODB, or a component the query needs). The problem is on this PC, not on the file server.$bits"; break
         }
         '0x80040E31|timeout|time-out|Zeitlimit' {
             "Hint: the index query on '$Machine' timed out. Narrow the search with 'path' or raise 'queryTimeout'."; break
@@ -725,12 +771,14 @@ function Search-Wss {
             # Fetch more than requested so blocked items do not crowd out allowed ones; widen once if needed.
             $fetch = [Math]::Min($limit * 3 + 20, 2000)
             for ($round = 0; $round -lt 2; $round++) {
-                $sql = New-WssSearchSql -Machine $srv.Machine -Scopes $plan.Scopes -Query $Arguments.query -Match $match `
-                    -Extensions $exts -Kind $Arguments.kind -Author $Arguments.author `
-                    -ModifiedAfter $Arguments.modified_after -ModifiedBefore $Arguments.modified_before `
-                    -IncludeFolders (ConvertTo-WssBool $Arguments.include_folders $false) -Sort $sort -Top $fetch
-                Write-WssLog "Query [$($srv.Machine)]: $sql"
-                $rows = @(Invoke-WssQuery -Machine $srv.Machine -Sql $sql -TimeoutSeconds $Config.QueryTimeout)
+                $build = {
+                    param($compat)
+                    New-WssSearchSql -Machine $srv.Machine -Scopes $plan.Scopes -Query $Arguments.query -Match $match `
+                        -Extensions $exts -Kind $Arguments.kind -Author $Arguments.author `
+                        -ModifiedAfter $Arguments.modified_after -ModifiedBefore $Arguments.modified_before `
+                        -IncludeFolders (ConvertTo-WssBool $Arguments.include_folders $false) -Sort $sort -Top $fetch -Compat $compat
+                }
+                $rows = @(Invoke-WssCompatQuery -Machine $srv.Machine -BuildSql $build -TimeoutSeconds $Config.QueryTimeout)
                 $allowed = New-Object System.Collections.ArrayList
                 $hiddenHere = 0
                 foreach ($r in $rows) {

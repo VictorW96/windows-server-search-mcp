@@ -15,6 +15,7 @@ BeforeAll {
             $script:TestSql = New-Object System.Collections.ArrayList
             $script:DriveProvider = { $script:TestDrives }
             $script:PolicyCache = @{}
+            $script:CompatLevel = @{}
             $script:RegistryPolicyProvider = { @($script:TestRegistry) }
             $script:PolicyFileReader = {
                 param($u)
@@ -257,6 +258,14 @@ Describe 'New-WssSearchSql' {
         { New-WssSearchSql -Machine 'fs01' -Kind "doc'x" } | Should -Throw
         { New-WssSearchSql -Machine 'fs01' -ModifiedAfter 'yesterday-ish' } | Should -Throw '*modified_after*'
     }
+    It 'simplifies the query for compat levels' {
+        $l1 = New-WssSearchSql -Machine 'm' -Query 'x' -Compat 1
+        $l1 | Should -Match '^SELECT TOP 50 System\.ItemUrl, System\.ItemPathDisplay, System\.FileName, System\.Size, System\.DateModified FROM'
+        $l1 | Should -Match 'ORDER BY System\.Search\.Rank DESC$'
+        New-WssSearchSql -Machine 'm' -Query 'x' -Compat 2 | Should -Match 'ORDER BY System\.DateModified DESC$'
+        New-WssSearchSql -Machine 'm' -Query 'x' -Sort name -Compat 2 | Should -Match 'ORDER BY System\.FileName ASC$'
+        New-WssSearchSql -Machine 'm' -Query 'x' -Compat 3 | Should -Not -Match 'ORDER BY'
+    }
     It 'excludes folders by default' {
         New-WssSearchSql -Machine 'm' -Query 'x' | Should -Match "System\.ItemType <> 'Directory'"
         New-WssSearchSql -Machine 'm' -Query 'x' -IncludeFolders $true | Should -Not -Match 'Directory'
@@ -325,6 +334,32 @@ Describe 'Search-Wss' {
         $client | Should -Match 'on this PC, not on the file server'
         $other = Get-WssErrorMessage (& $err ([Exception]::new('Item not found'))) 'fs01'
         $other | Should -Be 'Item not found'
+    }
+    It 'retries with simpler SQL when the client reports class not registered, and remembers the level' {
+        Set-TestBackend -Drives @(@{ Drive = 'T:'; Unc = '\\fs01\daten' }) -Rows @{ fs01 = @(@{ 'System.ItemUrl' = 'file://fs01/daten/a.txt'; 'System.FileName' = 'a.txt' }) }
+        & $script:Mod {
+            $script:InnerExecutor = $script:QueryExecutor
+            $script:QueryExecutor = {
+                param($m, $sql, $t)
+                if ($sql -match 'System\.Kind,|ORDER BY System\.Search\.Rank') {
+                    [void]$script:TestSql.Add(@{ Machine = $m; Sql = $sql })
+                    throw [Management.Automation.MethodInvocationException]::new('Exception calling "Open"', [Runtime.InteropServices.COMException]::new('Klasse nicht registriert', [int]0x80040154))
+                }
+                & $script:InnerExecutor $m $sql $t
+            }
+        }
+        $r = Search-Wss -Arguments @{ query = 'a' } -Config (New-TestConfig)
+        $r.result_count | Should -Be 1
+        $r.results[0].drive_path | Should -Be 'T:\a.txt'
+        @(Get-TestSql).Count | Should -Be 3
+        (Get-TestSql)[2].Sql | Should -Match 'ORDER BY System\.DateModified DESC$'
+        $null = Search-Wss -Arguments @{ query = 'b' } -Config (New-TestConfig)
+        @(Get-TestSql).Count | Should -Be 4
+    }
+    It 'does not retry other errors' {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' }) -Errors @{ fs01 = 'boom 0x80070005' }
+        { Search-Wss -Arguments @{ query = 'x' } -Config (New-TestConfig) } | Should -Throw '*permission problem*'
+        @(Get-TestSql).Count | Should -Be 1
     }
     It 'throws when every server fails' {
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' }) -Errors @{ fs01 = 'nope' }
