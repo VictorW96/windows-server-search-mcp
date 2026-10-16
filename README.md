@@ -111,14 +111,15 @@ only copied into the workspace (marker) or the download folder, not to another `
 
 You can block folders and files with wildcard patterns. Claude can't **find, list, read or copy** what they
 match. Search reports how many matches were hidden (`hidden_by_policy`), so the user knows something was
-withheld. Rules come from four sources and are combined. A source can only *add* blocks, never remove
+withheld. Rules come from five sources and are combined. A source can only *add* blocks, never remove
 blocks set elsewhere:
 
 | Source | Maintained by | Setup on client PCs |
 |---|---|---|
 | **`.claude-policy` file in the root of a share**, gitignore style ([example](examples/.claude-policy)) | File server admins; protect it with NTFS permissions | **None.** Picked up automatically and re-read every 5 minutes (`WSS_POLICY_TTL`) |
 | **Group Policy / Intune**: registry value `DenyPaths` (REG_MULTI_SZ or `;`-separated) under `HKLM\SOFTWARE\Policies\WindowsServerSearchMcp` (or HKCU\…\Policies) | IT, centrally; users cannot write these keys | **None.** Deployed centrally |
-| **Plugin option "Blocked paths"** (`WSS_DENY`) | The user | Optional |
+| **Your own `.claude-policy`**: `%APPDATA%\windows-server-search-mcp\.claude-policy`, same gitignore style, applies to every share | The user | **None.** Created empty (comments only) when the plugin first starts; changes apply immediately |
+| **Plugin option "Blocked paths"** (`WSS_DENY`) | The user (Claude Code) | Optional |
 | **Built-in**: `$RECYCLE.BIN`, `System Volume Information`, `*.kdbx`, `*.kdb`, `*.pfx`, `*.p12`, `~$*` | – | None |
 
 **Pattern syntax** (case-insensitive; `/` and `\` are interchangeable):
@@ -133,6 +134,8 @@ blocks set elsewhere:
   - `name` matches at any depth;
   - `/name` and `a/b` are anchored to the share root.
   
+  Your own `.claude-policy` in `%APPDATA%` uses the same rules, relative to the root of **every** share.
+  It also accepts server paths (`\\fs01\hr`) and drive paths (`Z:\Finance`).
   `!` negations are not supported.
 
 Example Group Policy deployment (or the same value through Intune / GPO preferences):
@@ -149,7 +152,8 @@ reg add HKLM\SOFTWARE\Policies\WindowsServerSearchMcp /v DenyPaths /t REG_MULTI_
 - **Links:** for reads, copies and listings, symbolic links that Windows follows on the client are resolved,
   and the real target is checked too.
 - **Fail closed:** if a share's `.claude-policy` exists but can't be read or parsed, that whole share is
-  blocked, and `list_servers` explains why.
+  blocked, and `list_servers` explains why. If your own `.claude-policy` can't be read or parsed, all shares
+  are blocked. A single pattern that can't be used (e.g. an unmapped drive letter) is only reported.
 - **Search filtering:** search examines `3 × max_results + 20` index hits, and up to 5000 if needed, so
   blocked files don't crowd out allowed ones. `hidden_by_policy` counts the blocked hits among those
   examined.
@@ -180,12 +184,15 @@ All settings are optional. A PC with mapped network drives works without any con
   Use the config file instead:
   `%APPDATA%\windows-server-search-mcp\config.json`. It needs no admin rights; see the
   [example](examples/config.json). The server reads it at every tool call, so changes apply immediately.
+- **Blocked paths:** `%APPDATA%\windows-server-search-mcp\.claude-policy`, gitignore style; see
+  [Access policy](#access-policy-blocked-paths).
 - **Company-wide:** blocked paths come from Group Policy or `.claude-policy` files on the shares; see
   [Access policy](#access-policy-blocked-paths).
 
 **How the sources combine:**
 
-- List settings (`servers`, `exclude`, `deny`) from the plugin options and the config file are merged.
+- List settings (`servers`, `exclude`) from the plugin options and the config file are merged. A `deny`
+  list in older config files is still honoured; new rules belong in `.claude-policy`.
 - For single values (`autoDiscover`, `maxResults`, `downloadDir`, …) the **config file wins** over the
   plugin options, because Cowork always passes the defaults.
 - `copy_file` refuses to write into the config folder.
@@ -195,7 +202,7 @@ All settings are optional. A PC with mapped network drives works without any con
 | Additional servers / shares | `servers` / `WSS_SERVERS` | – | `;`-separated UNC paths, e.g. `\\fs01\projects;\\fs02`. A bare server searches all its shares (via `net view`) |
 | Use mapped network drives | `autoDiscover` / `WSS_AUTO_DISCOVER` | `true` | Auto-discover servers from mapped drives (CIM `Win32_LogicalDisk`, `HKCU\Network`, PSDrives) |
 | Exclude servers / shares | `exclude` / `WSS_EXCLUDE` | – | `;`-separated server names or UNC shares to ignore |
-| Blocked paths | `deny` / `WSS_DENY` | – | `;`-separated wildcard patterns; see [Access policy](#access-policy-blocked-paths) |
+| Blocked paths | `WSS_DENY` | – | `;`-separated wildcard patterns; in Cowork use `.claude-policy` instead, see [Access policy](#access-policy-blocked-paths) |
 | – | `policyTtl` / `WSS_POLICY_TTL` | `300` | Seconds to cache share `.claude-policy` files |
 | Default maximum results | `maxResults` / `WSS_MAX_RESULTS` | `50` | 1–500 |
 | Download folder | `downloadDir` / `WSS_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads\Windows Server Search` | Default destination for `copy_file` |
@@ -206,7 +213,7 @@ All settings are optional. A PC with mapped network drives works without any con
 | – | `write.logPath` / `WSS_WRITE_LOG` | `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl` | Write audit log |
 | – | `queryTimeout` / `WSS_QUERY_TIMEOUT` | `30` | Seconds per index query |
 | – | `useNetBios` / `WSS_USE_NETBIOS` | `true` | Query FQDN hosts by their NetBIOS name, which Windows Search requires |
-| – | `WSS_CONFIG_FILE` | `%APPDATA%\windows-server-search-mcp\config.json` | JSON file with `servers`, `exclude`, `autoDiscover`, `maxResults`, … |
+| – | `WSS_CONFIG_FILE` | `%APPDATA%\windows-server-search-mcp\config.json` | JSON file with `servers`, `exclude`, `autoDiscover`, `maxResults`, …; the user's `.claude-policy` is read from the same folder |
 
 ### Server requirements
 

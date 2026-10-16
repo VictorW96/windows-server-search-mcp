@@ -15,4 +15,7 @@ if (Test-Path -LiteralPath $versionFile) { Set-WssVersion ((Get-Content -Literal
 
 if ($env:WSS_FAKE_BACKEND) { Enable-WssFakeBackend -Path $env:WSS_FAKE_BACKEND }
 
+# Create an empty (comments only) %APPDATA%\windows-server-search-mcp\.claude-policy on first start.
+[void](Initialize-WssUserPolicy -Config (Get-WssConfig))
+
 Start-WssServer

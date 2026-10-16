@@ -138,6 +138,10 @@ Describe 'Get-WssConfig' {
         $c.Deny | Should -Be @('*.kdbx', '**\HR', '**\Personal')
         Remove-Item env:WSS_DENY -ErrorAction SilentlyContinue
     }
+    It 'puts the user policy file next to the config file' {
+        $c = Get-WssConfig
+        $c.PolicyFile | Should -Be (Join-Path (Split-Path $env:WSS_CONFIG_FILE) '.claude-policy')
+    }
 }
 
 Describe 'ConvertFrom-WssNetView' {
@@ -648,6 +652,23 @@ Describe 'Access policy: patterns' {
     ) {
         Test-Pattern $pattern $path '\\fs01\data' | Should -Be $expected
     }
+    It 'user policy (gitignore, every share) semantics: <pattern> vs <path> -> <expected>' -TestCases @(
+        @{ pattern = 'secret'; path = '\\fs01\data\secret\x.txt'; expected = $true }
+        @{ pattern = 'secret'; path = '\\fs02\other\a\b\secret'; expected = $true }
+        @{ pattern = 'secret'; path = '\\fs01\secret\x.txt'; expected = $false }
+        @{ pattern = '/HR'; path = '\\fs02\other\HR\x.txt'; expected = $true }
+        @{ pattern = '/HR'; path = '\\fs02\other\a\HR\x.txt'; expected = $false }
+        @{ pattern = 'a/secret'; path = '\\fs01\data\a\secret\x'; expected = $true }
+        @{ pattern = 'a/secret'; path = '\\fs01\data\b\a\secret\x'; expected = $false }
+        @{ pattern = '*.kdbx'; path = '\\fs01\data\x\vault.KDBX'; expected = $true }
+        @{ pattern = '\\fs01\data\*\Contracts'; path = '\\fs01\data\P\Contracts\c.pdf'; expected = $true }
+        @{ pattern = '//fs01/data/finance'; path = '\\fs01\data\Finance\q1.xlsx'; expected = $true }
+        @{ pattern = 'Z:\Finance'; path = '\\fs01\data\finance\q1.xlsx'; expected = $true }
+    ) {
+        $t = @(@{ Name = 'fs01'; Machine = 'fs01'; Shares = @(@{ Name = 'data'; Unc = '\\fs01\data'; Drives = @('Z:') }) })
+        $rule = New-WssPolicyRule -Pattern $pattern -Source 'test' -Targets $t -AnyShare
+        $rule.Regex.IsMatch((Get-WssCanonicalUnc $path)) | Should -Be $expected
+    }
     It 'rejects invalid patterns' {
         { New-WssPolicyRule -Pattern 'a|b' -Source t } | Should -Throw
         { New-WssPolicyRule -Pattern '   ' -Source t } | Should -Throw
@@ -690,6 +711,43 @@ Describe 'Access policy: sources and enforcement' {
         (Test-WssBlocked '\\fs01\data\secret\a.txt' $p).Source | Should -Be 'share-policy \\fs01\data'
         (Test-WssBlocked '\\fs01\data\$RECYCLE.BIN\a.txt' $p).Source | Should -Be 'built-in'
         Test-WssBlocked '\\fs01\data\public\a.txt' $p | Should -BeNullOrEmpty
+    }
+    It 'applies the user .claude-policy to every share' {
+        $f = Join-Path ([IO.Path]::GetTempPath()) "wss-userpol-$([guid]::NewGuid())"
+        Set-Content -LiteralPath $f -Value "# mine`nPersonal/`n/HR`n!keep`nQ:\nope"
+        try {
+            Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }, @{ Drive = 'Y:'; Unc = '\\fs02\team' })
+            $cfg = New-TestConfig; $cfg.PolicyFile = $f
+            $p = Get-WssPolicy -Config $cfg -Targets @(Get-WssTargets -Config $cfg)
+            $p.Counts['user-policy'] | Should -Be 2
+            @($p.Warnings).Count | Should -Be 2
+            ($p.PolicyFiles | Where-Object { $_.file -eq $f }).rules | Should -Be 2
+            (Test-WssBlocked '\\fs01\data\a\Personal\x.txt' $p).Source | Should -Be 'user-policy'
+            (Test-WssBlocked '\\fs02\team\HR\x.txt' $p).Source | Should -Be 'user-policy'
+            Test-WssBlocked '\\fs02\team\a\HR\x.txt' $p | Should -BeNullOrEmpty
+        } finally { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
+    }
+    It 'fails closed when the user .claude-policy is invalid' {
+        $f = Join-Path ([IO.Path]::GetTempPath()) "wss-userpol-$([guid]::NewGuid())"
+        Set-Content -LiteralPath $f -Value "bad|line"
+        try {
+            Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' })
+            $cfg = New-TestConfig; $cfg.PolicyFile = $f
+            $p = Get-WssPolicy -Config $cfg -Targets @(Get-WssTargets -Config $cfg)
+            @($p.BlockedShares).Count | Should -Be 1
+            (Test-WssBlocked '\\fs01\data\a.txt' $p).Source | Should -Be 'user-policy-error'
+        } finally { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
+    }
+    It 'creates an empty user .claude-policy once and never overwrites it' {
+        $dir = Join-Path ([IO.Path]::GetTempPath()) "wss-init-$([guid]::NewGuid())"
+        $cfg = New-TestConfig; $cfg.PolicyFile = Join-Path $dir '.claude-policy'
+        try {
+            Initialize-WssUserPolicy -Config $cfg | Should -BeTrue
+            (ConvertFrom-WssPolicyText (Get-Content -LiteralPath $cfg.PolicyFile -Raw)).Patterns.Count | Should -Be 0
+            Set-Content -LiteralPath $cfg.PolicyFile -Value 'mine'
+            Initialize-WssUserPolicy -Config $cfg | Should -BeFalse
+            (Get-Content -LiteralPath $cfg.PolicyFile -Raw).Trim() | Should -Be 'mine'
+        } finally { Remove-Item -LiteralPath $dir -Recurse -ErrorAction SilentlyContinue }
     }
     It 'fails closed when a share policy file is unreadable or invalid' {
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }, @{ Drive = 'Y:'; Unc = '\\fs01\hr' }, @{ Drive = 'X:'; Unc = '\\fs01\ok' }) -Policies @{

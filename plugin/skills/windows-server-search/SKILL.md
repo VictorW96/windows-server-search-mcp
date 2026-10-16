@@ -52,7 +52,9 @@ so they can open the file themselves.
 ## Access policy
 
 Some folders or files may be blocked by an access policy, set by IT in a `.claude-policy` file on the
-share or through Group Policy, or by the user in the plugin settings. Blocked items never appear in results.
+share or through Group Policy, or by the user in `%APPDATA%\windows-server-search-mcp\.claude-policy`
+(gitignore style, applies to every share) or the plugin settings. Blocked items never appear in results.
+If the user wants to block something, explain how to add a line to that file; you cannot edit it yourself.
 
 - When `search_files` or `list_directory` returns `hidden_by_policy` > 0, **tell the user how many results
   were hidden by the access policy**, e.g. "3 matching files were hidden by your organisation's access policy".

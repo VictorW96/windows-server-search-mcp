@@ -43,7 +43,7 @@
     "deny_paths": {
       "type": "string",
       "title": "Blocked paths",
-      "description": "Optional. Wildcard patterns Claude may never search, list, read or copy, separated by ';' (e.g. \\\\fs01\\hr\\**;**\\Personal;**\\*.kdbx). IT can also block paths centrally via a .claude-policy file in each share or Group Policy.",
+      "description": "Optional. Wildcard patterns Claude may never search, list, read or copy, separated by ';' (e.g. \\\\fs01\\hr\\**;**\\Personal;**\\*.kdbx). In Cowork, list them gitignore-style in %APPDATA%\\windows-server-search-mcp\\.claude-policy instead. IT can also block paths centrally via a .claude-policy file in each share or Group Policy.",
       "default": "",
       "required": false
     },

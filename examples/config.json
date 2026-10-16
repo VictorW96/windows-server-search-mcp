@@ -7,10 +7,6 @@
   "exclude": [
     "\\\\fs01\\scratch"
   ],
-  "deny": [
-    "**\\Personal",
-    "\\\\fs01\\projects\\*\\Contracts"
-  ],
   "maxResults": 50,
   "downloadDir": "C:\\Users\\me\\Documents\\Claude",
   "write": {

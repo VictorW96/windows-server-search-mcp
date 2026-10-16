@@ -173,6 +173,7 @@ function Get-WssConfig {
         WSS_QUERY_TIMEOUT    seconds per index query (default 30)
         WSS_USE_NETBIOS      true|false (default true) - query FQDN hosts by short name
         WSS_DENY             ; or newline separated deny patterns (wildcards), e.g. \\fs01\hr\**;**\Personal
+                             (Cowork: use the .claude-policy file next to the config file instead)
         WSS_POLICY_TTL       seconds to cache share .claude-policy files (default 300)
         WSS_DOWNLOAD_DIR     default local folder for copy_file
         WSS_MAX_COPY_MB      maximum size per copied file in MB (default 500)
@@ -180,7 +181,8 @@ function Get-WssConfig {
         WSS_WRITE_OVERWRITE  true|false (default true) - allow overwriting (old version kept as backup)
         WSS_WRITE_MAX_MB     maximum size per written file in MB (default 100)
         WSS_WRITE_LOG        write log path (default %LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl)
-        WSS_CONFIG_FILE      path to JSON config file (default %APPDATA%\windows-server-search-mcp\config.json)
+        WSS_CONFIG_FILE      path to JSON config file (default %APPDATA%\windows-server-search-mcp\config.json);
+                             the user's .claude-policy file lives in the same folder
     #>
     $file = @{}
     $path = $env:WSS_CONFIG_FILE
@@ -246,6 +248,7 @@ function Get-WssConfig {
         WriteMaxMB     = ConvertTo-WssInt (Pick 'WSS_WRITE_MAX_MB' 'writeMaxMB') 100 1 102400
         WriteLogPath   = (Pick 'WSS_WRITE_LOG' 'writeLogPath')
         ConfigFile     = $path
+        PolicyFile     = $(if ($path) { [IO.Path]::Combine([IO.Path]::GetDirectoryName($path), $script:PolicyFileName) })
     }
 }
 
@@ -1176,6 +1179,29 @@ $script:BuiltinDenyPatterns = @(
 $script:PolicyCache = @{}
 $script:RegistryPolicyProvider = $null   # scriptblock: -> array of patterns (tests / fake backend)
 $script:PolicyFileReader = $null         # scriptblock: param($ShareUnc) -> @{ Status='none'|'ok'|'error'; Content; Error }
+$script:UserPolicyTemplate = @'
+# .claude-policy - your own blocked paths for the windows-server-search Claude plugin.
+# Same syntax as the .claude-policy files in the root of a share; here every rule applies to ALL shares.
+# Claude can neither find (search), list, read nor copy matching files and folders. Changes apply immediately.
+#
+# Syntax (like .gitignore, case-insensitive, / and \ both work):
+#   name          matches a file or folder with that name at any depth in every share
+#   /name         only directly in the root of a share
+#   a/b           a path relative to the root of a share (anchored because it contains a slash)
+#   *             any characters within one name     ?   one character
+#   **            any number of folders
+#   \\fs01\hr     a specific server or share (also \\*\hr, \\fs01\projects\*\Contracts)
+#   Z:\Finance    a path on a mapped network drive
+# A matching folder blocks everything below it. Lines starting with # are comments.
+# "!" negations are not supported (rules can only block, never re-allow).
+#
+# Examples:
+#   Personal/
+#   /HR
+#   *.kdbx
+#   \\fs01\projects\*\Contracts
+
+'@
 $script:FinalPathTypeLoaded = $false
 
 function Get-WssCanonicalUnc {
@@ -1242,18 +1268,21 @@ function New-WssPolicyRule {
       or floating patterns (match at any depth on any share). With -ShareRoot (a share's .claude-policy):
       gitignore semantics - patterns with a leading or middle '\' are anchored at the share root,
       others match at any depth inside the share. A matching folder blocks everything below it.
+      With -AnyShare (the user's .claude-policy): the same gitignore semantics relative to every share;
+      server paths (\\server\...) and drive paths (Z:\...) keep their global meaning.
     #>
-    param([string]$Pattern, [string]$Source, [string]$ShareRoot, $Targets = @())
+    param([string]$Pattern, [string]$Source, [string]$ShareRoot, $Targets = @(), [switch]$AnyShare)
     $p = $Pattern.Trim() -replace '/', '\'
     if (-not $p) { throw 'empty pattern' }
     if ($p -match '[<>|"\x00-\x1f]') { throw "invalid characters in pattern '$Pattern'" }
-    if ($ShareRoot) {
+    $relative = $ShareRoot -or ($AnyShare -and -not $p.StartsWith('\\') -and $p -notmatch '^[A-Za-z]:')
+    if ($relative) {
         $anchored = $false
         if ($p.StartsWith('\')) { $anchored = $true; $p = $p.TrimStart('\') }
         $p = $p.TrimEnd('\')
         if ($p.Contains('\')) { $anchored = $true }
         if (-not $p) { throw "pattern '$Pattern' matches the whole share; remove the share instead" }
-        $body = [regex]::Escape($ShareRoot.ToLowerInvariant()) + '\\'
+        if ($ShareRoot) { $body = [regex]::Escape($ShareRoot.ToLowerInvariant()) + '\\' } else { $body = '\\\\[^\\]+\\[^\\]+\\' }
         if ($anchored) { $body += (ConvertTo-WssGlobRegex $p) } else { $body += '(?:.*\\)?' + (ConvertTo-WssGlobRegex $p) }
     } else {
         if ($p -match '^([A-Za-z]:)(\\.*)?$') {
@@ -1346,6 +1375,36 @@ function Read-WssSharePolicy {
     return $value
 }
 
+function Read-WssUserPolicy {
+    <# Reads the user's own .claude-policy (next to the config file). Returns @{ Status='none'|'ok'|'error'; Content; Error }. #>
+    param([string]$Path)
+    if (-not $Path) { return @{ Status = 'none' } }
+    try {
+        if (-not [IO.File]::Exists($Path)) { return @{ Status = 'none' } }
+        if ((New-Object IO.FileInfo($Path)).Length -gt 1MB) { return @{ Status = 'error'; Error = 'policy file is larger than 1 MB' } }
+        return @{ Status = 'ok'; Content = [IO.File]::ReadAllText($Path) }
+    } catch {
+        return @{ Status = 'error'; Error = $_.Exception.Message }
+    }
+}
+
+function Initialize-WssUserPolicy {
+    <# Creates the user's .claude-policy (comments only, no rules) if it doesn't exist yet, so it is easy to find. #>
+    param([hashtable]$Config)
+    $path = $Config.PolicyFile
+    if (-not $path -or (Test-Path -LiteralPath $path)) { return $false }
+    try {
+        $dir = [IO.Path]::GetDirectoryName($path)
+        if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+        [IO.File]::WriteAllText($path, ($script:UserPolicyTemplate -replace "`r?`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
+        Write-WssLog "created $path"
+        return $true
+    } catch {
+        Write-WssLog "could not create '$path': $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Get-WssPolicy {
     <# Combines all deny sources. Sources can only add rules; a broken share policy blocks that share (fail closed). #>
     param([hashtable]$Config, $Targets)
@@ -1353,7 +1412,7 @@ function Get-WssPolicy {
     $warnings = New-Object System.Collections.ArrayList
     $blocked = New-Object System.Collections.ArrayList
     $files = New-Object System.Collections.ArrayList
-    $counts = [ordered]@{ 'built-in' = 0; 'group-policy' = 0; 'plugin-config' = 0; 'share-policy' = 0 }
+    $counts = [ordered]@{ 'built-in' = 0; 'group-policy' = 0; 'plugin-config' = 0; 'user-policy' = 0; 'share-policy' = 0 }
 
     $global = @()
     foreach ($p in $script:BuiltinDenyPatterns) { $global += , @($p, 'built-in') }
@@ -1366,6 +1425,40 @@ function Get-WssPolicy {
         } catch {
             [void]$warnings.Add("$($g[1]) pattern '$($g[0])' ignored: $($_.Exception.Message)")
         }
+    }
+
+    # The user's own .claude-policy: gitignore style like a share's, applied to every share.
+    $userFile = $Config.PolicyFile
+    $state = Read-WssUserPolicy $userFile
+    $reason = $null
+    if ($state.Status -eq 'ok') {
+        try {
+            $parsed = ConvertFrom-WssPolicyText $state.Content
+            $n = 0
+            foreach ($p in $parsed.Patterns) {
+                try {
+                    [void]$rules.Add((New-WssPolicyRule -Pattern $p -Source 'user-policy' -Targets $Targets -AnyShare))
+                    $n++
+                } catch {
+                    [void]$warnings.Add("$userFile pattern '$p' ignored: $($_.Exception.Message)")
+                }
+            }
+            $counts['user-policy'] = $n
+            foreach ($w in $parsed.Warnings) { [void]$warnings.Add("$userFile $w") }
+            [void]$files.Add([ordered]@{ file = $userFile; rules = $n })
+        } catch {
+            $reason = "invalid ${userFile}: $($_.Exception.Message)"
+        }
+    } elseif ($state.Status -eq 'error') {
+        $reason = "$userFile could not be read: $($state.Error)"
+    }
+    if ($reason) {
+        # Fail closed: without the user's rules nothing is safe to show.
+        [void]$blocked.Add([ordered]@{ share = '(all shares)'; reason = $reason })
+        [void]$rules.Add(@{
+                Pattern = $userFile; Source = 'user-policy-error'
+                Regex   = New-Object regex('^\\\\', ([Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'))
+            })
     }
 
     $seen = @{}
