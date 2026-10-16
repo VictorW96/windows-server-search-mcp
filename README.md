@@ -15,7 +15,7 @@ index**, and read the files it finds.
 ## Install (Claude Cowork / Desktop / Code)
 
 The plugin is published in the marketplaces [VictorW96/agentic-marketplace](https://github.com/VictorW96/agentic-marketplace)
-and [PMI-ING/agentic-marketplace](https://github.com/PMI-ING/agentic-marketplace) (install it as
+and [PMI-ING/marketplace](https://github.com/PMI-ING/marketplace) (install it as
 `windows-server-search@pmi-ing-marketplace`). Add only one of them.
 
 - **Cowork / Claude Desktop:** *Customize → Plugins → Add marketplace* → `VictorW96/agentic-marketplace`, then
@@ -283,7 +283,7 @@ scripts/release.sh    # build, tag v$(cat VERSION), GitHub release, publish into
 ```
 
 To release: bump `VERSION`, commit, run `scripts/release.sh`. It publishes to every repo in `MARKETPLACE_REPOS`
-(default `VictorW96/agentic-marketplace PMI-ING/agentic-marketplace`) and needs `gh` with push access to all of them.
+(default `VictorW96/agentic-marketplace PMI-ING/marketplace`) and needs `gh` with push access to all of them.
 Pushing a `v*` tag also runs the CI `release` job. That job publishes to the marketplaces when the
 `MARKETPLACE_TOKEN` secret holds a token with write access to every marketplace repo.
 

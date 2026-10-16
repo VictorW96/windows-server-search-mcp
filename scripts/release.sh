@@ -9,7 +9,7 @@
 # Usage: scripts/release.sh [--marketplace-dir DIR] [--dry-run] [--skip-github-release]
 #        --marketplace-dir publishes to a local checkout instead of cloning MARKETPLACE_REPOS.
 # Env:   MARKETPLACE_REPOS (space separated; default
-#          "VictorW96/agentic-marketplace PMI-ING/agentic-marketplace")
+#          "VictorW96/agentic-marketplace PMI-ING/marketplace")
 #        MARKETPLACE_TOKEN (optional; token used to push the marketplaces, e.g. in CI)
 set -euo pipefail
 
@@ -17,7 +17,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="windows-server-search"
 VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 TAG="v$VERSION"
-MARKETPLACE_REPOS="${MARKETPLACE_REPOS:-${MARKETPLACE_REPO:-VictorW96/agentic-marketplace PMI-ING/agentic-marketplace}}"
+MARKETPLACE_REPOS="${MARKETPLACE_REPOS:-${MARKETPLACE_REPO:-VictorW96/agentic-marketplace PMI-ING/marketplace}}"
 SOURCE_REPO="${SOURCE_REPO:-VictorW96/windows-server-search-mcp}"
 MP_DIR=""
 DRY_RUN=0
