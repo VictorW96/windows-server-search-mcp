@@ -9,6 +9,8 @@
   ],
   "maxResults": 50,
   "downloadDir": "C:\\Users\\me\\Documents\\Claude",
+  "useIFilter": true,
+  "discoveryTtl": 60,
   "write": {
     "enabled": true,
     "allowOverwrite": true,

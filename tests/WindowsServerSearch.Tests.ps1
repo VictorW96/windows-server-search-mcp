@@ -16,6 +16,7 @@ BeforeAll {
             $script:DriveProvider = { $script:TestDrives }
             $script:PolicyCache = @{}
             $script:CompatLevel = @{}
+            $script:TargetCache = $null
             $script:RegistryPolicyProvider = { @($script:TestRegistry) }
             $script:PolicyFileReader = {
                 param($u)
@@ -397,7 +398,7 @@ Describe 'Search-Wss' {
     It 'limits results' {
         $r = Search-Wss -Arguments @{ query = 'plan'; max_results = 1 } -Config (New-TestConfig)
         $r.result_count | Should -Be 1
-        (Get-TestSql)[0].Sql | Should -Match '^SELECT TOP 23 ' -Because 'limit*3+20 rows are examined so blocked files do not crowd out allowed ones'
+        (Get-TestSql)[0].Sql | Should -Match '^SELECT TOP 26 ' -Because '(limit+1)*3+20 rows are examined so blocked files do not crowd out allowed ones (+1 tells whether there is a next page)'
     }
 }
 
@@ -446,10 +447,12 @@ Describe 'Get-WssDocumentText' {
         [IO.File]::WriteAllText($p, 'hello', [Text.Encoding]::Unicode)
         Get-WssDocumentText $p | Should -Be 'hello'
     }
-    It 'rejects binary files' {
+    It 'rejects binary files without readable text' {
         $p = Join-Path $Dir 'b.bin'
         [IO.File]::WriteAllBytes($p, [byte[]](1, 0, 2, 3))
-        { Get-WssDocumentText $p } | Should -Throw '*binary*'
+        # Elsewhere: "looks like a binary file"; on Windows the filter finds no filter or no text.
+        { Get-WssDocumentText $p } | Should -Throw '*copy_file*'
+        { Get-WssDocumentText $p -Config @{ UseIFilter = $false } } | Should -Throw '*binary*'
     }
     It 'extracts docx text' {
         $p = Join-Path $Dir 'd.docx'
@@ -476,6 +479,124 @@ Describe 'Get-WssDocumentText' {
         $text = Get-WssDocumentText $p
         $text.IndexOf('One') | Should -BeLessThan $text.IndexOf('Two')
         $text.IndexOf('Two') | Should -BeLessThan $text.IndexOf('Ten')
+    }
+    It 'keeps xlsx columns when cells are empty, with row numbers' {
+        $p = Join-Path $Dir 'sparse.xlsx'
+        New-Zip $p @{
+            'xl/sharedStrings.xml'     = '<sst><si><t>Name</t></si><si><r><t>To</t></r><r><t>tal</t></r></si><si/><si><t>Q3</t></si></sst>'
+            'xl/worksheets/sheet1.xml' = '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c><c r="D1" t="s"><v>3</v></c></row><row r="3"/><row r="5"><c r="A5" t="inlineStr"><is><t>Bob</t></is></c><c r="D5"><v>42</v></c></row></sheetData></worksheet>'
+        }
+        $lines = @((Get-WssDocumentText $p) -split "`n")
+        $lines[1] | Should -Be "1`tName`t`tTotal`tQ3"
+        $lines[2] | Should -Be "5`tBob`t`t`t42" -Because 'an empty self-closing row must not swallow the next row, and D5 stays in column D'
+        $lines.Count | Should -Be 3
+    }
+    It 'uses real sheet names in workbook order and formats dates, percentages and booleans' {
+        $p = Join-Path $Dir 'named.xlsx'
+        New-Zip $p @{
+            'xl/workbook.xml'            = '<workbook xmlns:r="r"><workbookPr/><sheets><sheet name="Q&amp;A" sheetId="5" r:id="rId9"/><sheet name="Data" sheetId="1" r:id="rId1" state="hidden"/></sheets></workbook>'
+            'xl/_rels/workbook.xml.rels' = '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId9" Target="/xl/worksheets/sheet2.xml"/><Relationship Id="rId3" Target="styles.xml"/></Relationships>'
+            'xl/styles.xml'              = '<styleSheet><numFmts><numFmt numFmtId="164" formatCode="dd/mm/yyyy\ hh:mm"/><numFmt numFmtId="165" formatCode="#,##0.00 &quot;EUR&quot;"/><numFmt numFmtId="166" formatCode="[h]:mm"/></numFmts><cellXfs><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/><xf numFmtId="10"/><xf numFmtId="165"/><xf numFmtId="166"/></cellXfs></styleSheet>'
+            'xl/worksheets/sheet1.xml'   = '<worksheet><dimension ref="A1:B1"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1" t="b"><v>1</v></c></row></sheetData></worksheet>'
+            'xl/worksheets/sheet2.xml'   = '<worksheet><sheetData><row r="1"><c r="A1" s="1"><v>45292</v></c><c r="B1" s="2"><v>45292.5</v></c><c r="C1" s="3"><v>0.125</v></c><c r="D1" s="4"><v>1234.5</v></c><c r="E1" s="5"><v>1.5</v></c><c r="F1" t="str"><f>A1</f><v>x</v></c></row></sheetData></worksheet>'
+        }
+        $text = Get-WssDocumentText $p
+        $text.IndexOf('--- Sheet: Q&A ---') | Should -BeLessThan $text.IndexOf('--- Sheet: Data (hidden) [A1:B1] ---')
+        $text | Should -Match ([regex]::Escape("1`t2024-01-01`t2024-01-01 12:00:00`t12.5%`t1234.5`t36:00:00`tx"))
+        $text | Should -Match "1`t1`tTRUE"
+    }
+    It 'converts 1904-based workbook dates' {
+        $p = Join-Path $Dir 'mac.xlsx'
+        New-Zip $p @{
+            'xl/workbook.xml'            = '<workbook><workbookPr date1904="1"/><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>'
+            'xl/_rels/workbook.xml.rels' = '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>'
+            'xl/styles.xml'              = '<styleSheet><cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>'
+            'xl/worksheets/sheet1.xml'   = '<worksheet><sheetData><row r="1"><c r="A1" s="1"><v>0</v></c></row></sheetData></worksheet>'
+        }
+        Get-WssDocumentText $p | Should -Match "1`t1904-01-01"
+    }
+    It 'reads docx tables, headers, footnotes and comments but not deleted text or field codes' {
+        $p = Join-Path $Dir 'full.docx'
+        $cell = { param($t) "<w:tc><w:p><w:r><w:t>$t</w:t></w:r></w:p></w:tc>" }
+        New-Zip $p @{
+            'word/document.xml'  = '<w:document><w:body><w:p><w:r><w:t>Intro</w:t></w:r><w:del><w:r><w:delText>gone</w:delText></w:r></w:del><w:r><w:instrText> TOC \o </w:instrText></w:r></w:p>' +
+                '<w:tbl><w:tr>' + (& $cell 'A') + '<w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc></w:tr><w:tr>' + (& $cell '1') + (& $cell '2') + '</w:tr></w:tbl>' +
+                '<w:p><w:r><w:t>After</w:t></w:r></w:p></w:body></w:document>'
+            'word/header1.xml'   = '<w:hdr><w:p><w:r><w:t>Confidential</w:t></w:r></w:p></w:hdr>'
+            'word/header2.xml'   = '<w:hdr><w:p><w:r><w:t>Confidential</w:t></w:r></w:p></w:hdr>'
+            'word/footnotes.xml' = '<w:footnotes><w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:t>SEP</w:t></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t>See annex.</w:t></w:r></w:p></w:footnote></w:footnotes>'
+            'word/comments.xml'  = '<w:comments><w:comment w:id="0" w:author="Ann &amp; Co"><w:p><w:r><w:t>Check this</w:t></w:r></w:p></w:comment></w:comments>'
+        }
+        $text = Get-WssDocumentText $p
+        $text | Should -Match "Intro`nA`tB1 B2`n1`t2`nAfter"
+        $text | Should -Not -Match 'gone|TOC|SEP'
+        ([regex]::Matches($text, 'Confidential')).Count | Should -Be 1
+        $text | Should -Match '--- header: Confidential'
+        $text | Should -Match '\[1\] See annex\.'
+        $text | Should -Match 'Ann & Co: Check this'
+    }
+    It 'keeps text after a deleted paragraph mark' {
+        $p = Join-Path $Dir 'tracked.docx'
+        New-Zip $p @{ 'word/document.xml' = '<w:document><w:body><w:p><w:pPr><w:rPr><w:del w:id="1" w:author="A"/></w:rPr></w:pPr><w:r><w:t>Kept one</w:t></w:r></w:p><w:p><w:r><w:t>Kept two</w:t></w:r><w:del w:id="2"><w:r><w:delText>gone</w:delText></w:r></w:del></w:p></w:body></w:document>' }
+        Get-WssDocumentText $p | Should -Be "Kept one`nKept two"
+    }
+    It 'reads pptx slides in presentation order with speaker notes' {
+        $p = Join-Path $Dir 'ordered.pptx'
+        New-Zip $p @{
+            'ppt/presentation.xml'              = '<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId3"/><p:sldId id="257" r:id="rId2"/></p:sldIdLst></p:presentation>'
+            'ppt/_rels/presentation.xml.rels'   = '<Relationships><Relationship Id="rId2" Target="slides/slide1.xml"/><Relationship Id="rId3" Target="slides/slide2.xml"/></Relationships>'
+            'ppt/slides/slide1.xml'             = '<p:sld><a:p><a:r><a:t>Moved last</a:t></a:r></a:p></p:sld>'
+            'ppt/slides/slide2.xml'             = '<p:sld><a:p><a:r><a:t>Opening</a:t></a:r></a:p></p:sld>'
+            'ppt/slides/_rels/slide2.xml.rels'  = '<Relationships><Relationship Id="rId1" Target="../notesSlides/notesSlide7.xml"/></Relationships>'
+            'ppt/notesSlides/notesSlide7.xml'   = '<p:notes><p:sp><p:nvSpPr><p:nvPr><p:ph type="sldImg"/></p:nvPr></p:nvSpPr></p:sp><p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Say hello</a:t></a:r></a:p></p:txBody></p:sp><p:sp><p:nvSpPr><p:nvPr><p:ph type="sldNum"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>1</a:t></a:r></a:p></p:txBody></p:sp></p:notes>'
+        }
+        $text = Get-WssDocumentText $p
+        $text | Should -Match "--- Slide 1 ---`nOpening`nNotes: Say hello`n--- Slide 2 ---`nMoved last"
+    }
+    It 'reports damaged Office files clearly' {
+        $p = Join-Path $Dir 'broken.docx'
+        [IO.File]::WriteAllText($p, 'not a zip')
+        { Get-WssDocumentText $p } | Should -Throw '*not a valid Office document*'
+    }
+    Context 'Windows filters' {
+        AfterEach { & $script:Mod { $script:IFilterExtractor = $null } }
+        It 'reads binary formats through the Windows filter' {
+            $p = Join-Path $Dir 'scan.pdf'
+            [IO.File]::WriteAllText($p, "%PDF-1.7`nbinary-ish but no NUL bytes")
+            & $script:Mod { $script:IFilterExtractor = { param($Path, $Max, $Ms) $script:FilterCall = @($Path, $Max, $Ms); @{ Text = "Page one`nPage two"; NoFilter = $false; HResult = 0; Truncated = $false } } }
+            Get-WssDocumentText $p -Config @{ FilterTimeout = 7 } | Should -Be "Page one`nPage two"
+            $call = & $script:Mod { $script:FilterCall }
+            $call[0] | Should -Be $p
+            $call[2] | Should -Be 7000
+        }
+        It 'explains a missing filter, an empty text layer and a disabled filter' {
+            $p = Join-Path $Dir 'old.doc'
+            [IO.File]::WriteAllBytes($p, [byte[]](0xD0, 0xCF, 0x11, 0, 1))
+            & $script:Mod { $script:IFilterExtractor = { @{ Text = $null; NoFilter = $true; HResult = -2147221164; Truncated = $false } } }
+            { Get-WssDocumentText $p } | Should -Throw '*No Windows filter (IFilter) for .doc files*copy_file*'
+            & $script:Mod { $script:IFilterExtractor = { @{ Text = "  `n "; NoFilter = $false; HResult = 0; Truncated = $false } } }
+            { Get-WssDocumentText $p } | Should -Throw '*No text found*scanned*'
+            { Get-WssDocumentText $p -Config @{ UseIFilter = $false } } | Should -Throw '*disabled (useIFilter)*'
+        }
+        It 'marks truncated filter output' {
+            $p = Join-Path $Dir 'big.msg'
+            [IO.File]::WriteAllBytes($p, [byte[]](1, 0, 2))
+            & $script:Mod { $script:IFilterExtractor = { @{ Text = 'abc'; NoFilter = $false; HResult = 0; Truncated = $true } } }
+            Get-WssDocumentText $p | Should -Match '^abc\n\[\.\.\. text truncated'
+        }
+        It 'prefers the filter for RTF and falls back to the raw text without one' {
+            $p = Join-Path $Dir 'memo.rtf'
+            [IO.File]::WriteAllText($p, '{\rtf1\ansi Hello}')
+            & $script:Mod { $script:IFilterExtractor = { @{ Text = 'Hello'; NoFilter = $false; HResult = 0; Truncated = $false } } }
+            Get-WssDocumentText $p | Should -Be 'Hello'
+            & $script:Mod { $script:IFilterExtractor = { @{ Text = $null; NoFilter = $true; HResult = 0; Truncated = $false } } }
+            Get-WssDocumentText $p | Should -Be '{\rtf1\ansi Hello}'
+        }
+        It 'compiles the filter interop code' -Skip:(-not ($PSVersionTable.PSVersion.Major -lt 6 -or $IsWindows)) {
+            # Only Windows has query.dll; compiling checks the C# also builds with the .NET Framework compiler (5.1).
+            & $script:Mod { Add-Type -TypeDefinition $script:IFilterSource -Language CSharp; $script:IFilterLoaded = $true }
+            ([type]'WssIFilter.Extractor') | Should -Not -BeNullOrEmpty
+        }
     }
 }
 
@@ -781,11 +902,11 @@ Describe 'Access policy: sources and enforcement' {
     }
     It 'widens the query when blocked results crowd out allowed ones' {
         $rows = @()
-        for ($i = 0; $i -lt 23; $i++) { $rows += @{ 'System.ItemUrl' = "file://fs01/data/secret/$i.txt"; 'System.FileName' = "$i.txt" } }
+        for ($i = 0; $i -lt 26; $i++) { $rows += @{ 'System.ItemUrl' = "file://fs01/data/secret/$i.txt"; 'System.FileName' = "$i.txt" } }
         Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\data' }) -Rows @{ fs01 = $rows } -Policies @{ '\\fs01\data' = @{ Status = 'ok'; Content = 'secret' } }
         $r = Search-Wss -Arguments @{ query = 'x'; max_results = 1 } -Config (New-TestConfig)
         @(Get-TestSql).Count | Should -Be 2
-        (Get-TestSql)[1].Sql | Should -Match '^SELECT TOP 92 '
+        (Get-TestSql)[1].Sql | Should -Match '^SELECT TOP 104 '
         $r.result_count | Should -Be 0
     }
     It 'refuses to search inside a blocked folder' {
@@ -974,7 +1095,7 @@ Describe 'MCP protocol' {
     It 'falls back to the latest supported version' {
         $r = Invoke-WssMessageLine '{"jsonrpc":"2.0","id":"a","method":"initialize","params":{"protocolVersion":"1999-01-01"}}' | ConvertFrom-Json
         $r.id | Should -Be 'a'
-        $r.result.protocolVersion | Should -Be '2025-06-18'
+        $r.result.protocolVersion | Should -Be '2025-11-25'
     }
     It 'ignores notifications' {
         Invoke-WssMessageLine '{"jsonrpc":"2.0","method":"notifications/initialized"}' | Should -BeNullOrEmpty
@@ -1010,5 +1131,160 @@ Describe 'MCP protocol' {
     }
     It 'answers ping' {
         (Invoke-WssMessageLine '{"jsonrpc":"2.0","id":7,"method":"ping"}' | ConvertFrom-Json).id | Should -Be 7
+    }
+}
+
+Describe 'Find-WssPassages' {
+    BeforeAll {
+        $script:Doc = (@(1..30 | ForEach-Object { "line $_" }) + @('The penalty', 'clause applies.', 'x', 'y', 'z', 'Another PENALTY CLAUSE here.')) -join "`n"
+    }
+    It 'returns the matching lines with context, ignoring case and line breaks' {
+        $r = Find-WssPassages -Text $Doc -Find 'penalty clause' -Context 1
+        $r.MatchCount | Should -Be 2
+        $r.Passages.Count | Should -Be 2
+        $r.Passages[0].line | Should -Be 30
+        $r.Passages[0].text | Should -Be "line 30`nThe penalty`nclause applies.`nx"
+        $Doc.Substring($r.Passages[0].offset).StartsWith('line 30') | Should -BeTrue -Because 'offset can be passed to read_file'
+        $r.Passages[1].text | Should -Be "z`nAnother PENALTY CLAUSE here."
+    }
+    It 'merges overlapping passages and limits their number' {
+        $r = Find-WssPassages -Text $Doc -Find 'line 1 OR line 2' -Context 0 -MaxPassages 3
+        $r.MatchCount | Should -Be 22 -Because '"line 1" matches lines 1 and 10-19, "line 2" lines 2 and 20-29'
+        $r.Passages.Count | Should -Be 2 -Because 'adjacent lines merge: lines 1-2 and lines 10-29'
+        $r.Passages[0].text | Should -Be "line 1`nline 2"
+        $r.Passages[1].line | Should -Be 10
+        $r.Passages[1].text | Should -Match '^line 10\n(.|\n)*line 29$'
+        $r2 = Find-WssPassages -Text $Doc -Find 'line 5 OR line 25' -Context 0 -MaxPassages 1
+        $r2.Passages.Count | Should -Be 1
+        $r2.Truncated | Should -BeTrue
+    }
+    It 'cuts very long lines around the match' {
+        $long = ('a' * 5000) + ' needle ' + ('b' * 5000)
+        $r = Find-WssPassages -Text $long -Find 'needle'
+        $r.Passages[0].text.Length | Should -BeLessThan 1600
+        $r.Passages[0].text | Should -Match '^\u2026a+ needle b+\u2026$'
+    }
+    It 'handles Windows line endings' {
+        $r = Find-WssPassages -Text "a`r`nthe cap`r`nb`r`n" -Find 'cap' -Context 1
+        $r.Passages[0].text | Should -Be "a`nthe cap`nb"
+        $r.Passages[0].line | Should -Be 1
+    }
+    It 'treats the search text literally' {
+        (Find-WssPassages -Text 'cost (EUR) 5' -Find '(EUR)').MatchCount | Should -Be 1
+        (Find-WssPassages -Text 'abc' -Find 'a.c').MatchCount | Should -Be 0
+        { Find-WssPassages -Text 'abc' -Find '  ' } | Should -Throw '*word or phrase*'
+    }
+}
+
+Describe 'Search snippets and paging' {
+    BeforeAll {
+        $script:SnipDir = Join-Path ([IO.Path]::GetTempPath()) "wss-snip-$([guid]::NewGuid())"
+        New-Item -ItemType Directory -Path $SnipDir | Out-Null
+        [IO.File]::WriteAllText((Join-Path $SnipDir 'a.txt'), ('filler ' * 50) + 'the Budgets for 2024 are final ' + ('tail ' * 60))
+        [IO.File]::WriteAllText((Join-Path $SnipDir 'b.txt'), 'nothing relevant')
+        [IO.File]::WriteAllText((Join-Path $SnipDir 'c.jpg'), 'budget')
+    }
+    AfterAll { Remove-Item $SnipDir -Recurse -Force -ErrorAction SilentlyContinue }
+    It 'adds text around the first match and skips files without one' {
+        # Local test files: on Windows the symlink check would refuse paths that are not on a share.
+        Mock -ModuleName WindowsServerSearch Get-WssFinalPath { $null }
+        $results = @(
+            [ordered]@{ name = 'a.txt'; path = (Join-Path $SnipDir 'a.txt') },
+            [ordered]@{ name = 'b.txt'; path = (Join-Path $SnipDir 'b.txt') },
+            [ordered]@{ name = 'c.jpg'; path = (Join-Path $SnipDir 'c.jpg') }
+        )
+        $n = Add-WssSnippets -Results $results -Query 'budget -draft' -Config @{} -Targets @() -Policy @{ Rules = @() }
+        $n | Should -Be 1
+        $results[0].snippet | Should -Match '^\u2026.*the Budgets for 2024 are final.*\u2026$'
+        $results[0].snippet | Should -Not -Match '\s{2}'
+        $results[1].Contains('snippet') | Should -BeFalse
+        $results[2].Contains('snippet') | Should -BeFalse -Because 'images are not read'
+    }
+    It 'pages through merged results with offset and next_offset' {
+        $rows = @{}
+        foreach ($srv in 'fs01', 'fs02') {
+            $rows[$srv] = @(1..3 | ForEach-Object { @{ 'System.ItemUrl' = "file://$srv/s/$_.txt"; 'System.FileName' = "$srv-$_.txt"; 'System.Search.Rank' = $(if ($srv -eq 'fs01') { 100 * $_ } else { 100 * $_ + 50 }) } })
+        }
+        Set-TestBackend -Drives @(@{ Drive = 'Y:'; Unc = '\\fs01\s' }, @{ Drive = 'Z:'; Unc = '\\fs02\s' }) -Rows $rows
+        $p1 = Search-Wss -Arguments @{ query = 'x'; max_results = 4 } -Config (New-TestConfig)
+        @($p1.results.name) | Should -Be @('fs02-3.txt', 'fs01-3.txt', 'fs02-2.txt', 'fs01-2.txt')
+        $p1.next_offset | Should -Be 4
+        $p2 = Search-Wss -Arguments @{ query = 'x'; max_results = 4; offset = 4 } -Config (New-TestConfig)
+        @($p2.results.name) | Should -Be @('fs02-1.txt', 'fs01-1.txt')
+        $p2.offset | Should -Be 4
+        $p2.Contains('next_offset') | Should -BeFalse
+        (Get-TestSql)[-1].Sql | Should -Match '^SELECT TOP 47 ' -Because '(offset+limit+1)*3+20'
+    }
+}
+
+Describe 'Discovery cache' {
+    BeforeEach {
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        & $script:Mod { $script:DriveCalls = 0; $script:DriveProvider = { $script:DriveCalls++; $script:TestDrives } }
+    }
+    It 'reuses discovered servers within the TTL and rediscovers on refresh or other settings' {
+        $cfg = (New-TestConfig) + @{ DiscoveryTtl = 60 }
+        $null = Get-WssTargets -Config $cfg
+        $t = @(Get-WssTargets -Config $cfg)
+        $t[0].Name | Should -Be 'fs01'
+        (& $script:Mod { $script:DriveCalls }) | Should -Be 1
+        $null = Get-WssTargets -Config $cfg -Refresh
+        (& $script:Mod { $script:DriveCalls }) | Should -Be 2
+        $null = Get-WssTargets -Config ((New-TestConfig -Exclude @('fs09')) + @{ DiscoveryTtl = 60 })
+        (& $script:Mod { $script:DriveCalls }) | Should -Be 3
+    }
+    It 'does not cache with a TTL of 0' {
+        $cfg = (New-TestConfig) + @{ DiscoveryTtl = 0 }
+        $null = Get-WssTargets -Config $cfg
+        $null = Get-WssTargets -Config $cfg
+        (& $script:Mod { $script:DriveCalls }) | Should -Be 2
+    }
+}
+
+Describe 'Date filters' {
+    It 'treats plain dates as local days and includes the whole modified_before day' {
+        $start = [DateTime]::SpecifyKind([datetime]'2024-03-10', 'Local').ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+        $end = [DateTime]::SpecifyKind([datetime]'2024-03-10T23:59:59', 'Local').ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+        Format-WssSqlDate '2024-03-10' 'x' | Should -Be "'$start'"
+        Format-WssSqlDate '2024-03-10' 'x' -EndOfDay | Should -Be "'$end'"
+        New-WssSearchSql -Machine 'm' -ModifiedBefore '2024-03-10' | Should -Match ([regex]::Escape("System.DateModified <= '$end'"))
+    }
+    It 'treats times without offset as local and honours Z and offsets' {
+        $local = [DateTime]::SpecifyKind([datetime]'2024-03-10T08:30:00', 'Local').ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+        Format-WssSqlDate '2024-03-10T08:30' 'x' | Should -Be "'$local'"
+        Format-WssSqlDate '2024-03-10T08:30:00Z' 'x' | Should -Be "'2024-03-10 08:30:00'"
+        Format-WssSqlDate '2024-03-10T08:30:00+02:00' 'x' | Should -Be "'2024-03-10 06:30:00'"
+        Format-WssSqlDate '2024-03-10' 'x' -EndOfDay:$false | Should -Not -Match '23:59'
+    }
+}
+
+Describe 'Structured tool output' {
+    AfterEach { & $script:Mod { $script:ProtocolVersion = $null } }
+    It 'declares output schemas and returns structuredContent from protocol 2025-06-18' {
+        $null = Invoke-WssMessageLine '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}'
+        $tools = (Invoke-WssMessageLine '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | ConvertFrom-Json).result.tools
+        foreach ($t in $tools) { $t.outputSchema.type | Should -Be 'object' -Because $t.name }
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        $r = (Invoke-WssMessageLine '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_servers","arguments":{}}}' | ConvertFrom-Json).result
+        $r.structuredContent.servers[0].name | Should -Be 'fs01'
+        ($r.content[0].text | ConvertFrom-Json).servers[0].name | Should -Be 'fs01'
+    }
+    It 'search results match the declared schema' {
+        $null = Invoke-WssMessageLine '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}'
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' }) -Rows @{ fs01 = @(@{ 'System.ItemUrl' = 'file://fs01/p/a.txt'; 'System.FileName' = 'a.txt'; 'System.Size' = 3; 'System.Search.Rank' = 1 }) }
+        $r = (Invoke-WssMessageLine '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_files","arguments":{"query":"a"}}}' | ConvertFrom-Json).result
+        $schema = (& $script:Mod { Get-WssOutputSchemas }).search_files
+        foreach ($req in $schema.required) { $r.structuredContent.PSObject.Properties.Name | Should -Contain $req }
+        $r.structuredContent.result_count | Should -BeOfType [long]
+        @($r.structuredContent.results).Count | Should -Be 1
+        $r.structuredContent.results[0].drive_path | Should -Be 'Z:\a.txt'
+    }
+    It 'keeps the old result format for older protocol versions' {
+        $null = Invoke-WssMessageLine '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}'
+        $tools = (Invoke-WssMessageLine '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | ConvertFrom-Json).result.tools
+        $tools[0].PSObject.Properties.Name | Should -Not -Contain 'outputSchema'
+        Set-TestBackend -Drives @(@{ Drive = 'Z:'; Unc = '\\fs01\p' })
+        $r = (Invoke-WssMessageLine '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_servers","arguments":{}}}' | ConvertFrom-Json).result
+        $r.PSObject.Properties.Name | Should -Not -Contain 'structuredContent'
     }
 }

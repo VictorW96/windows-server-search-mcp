@@ -5,7 +5,8 @@
 
 $script:ServerName = 'windows-server-search'
 $script:ServerVersion = '0.0.0-dev'
-$script:SupportedProtocolVersions = @('2025-06-18', '2025-03-26', '2024-11-05')
+$script:SupportedProtocolVersions = @('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
+$script:ProtocolVersion = $null   # negotiated in initialize
 
 # Pluggable backends. Tests (and WSS_FAKE_BACKEND) replace these.
 $script:QueryExecutor = $null      # scriptblock: param($Machine, $Sql, $TimeoutSeconds) -> array of hashtables
@@ -181,6 +182,9 @@ function Get-WssConfig {
         WSS_WRITE_OVERWRITE  true|false (default true) - allow overwriting (old version kept as backup)
         WSS_WRITE_MAX_MB     maximum size per written file in MB (default 100)
         WSS_WRITE_LOG        write log path (default %LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl)
+        WSS_USE_IFILTER      true|false (default true) - read PDF, .doc, .rtf, .msg ... through Windows filters
+        WSS_FILTER_TIMEOUT   seconds per Windows filter run (default 60)
+        WSS_DISCOVERY_TTL    seconds to reuse discovered servers/shares between tool calls (default 60)
         WSS_CONFIG_FILE      path to JSON config file (default %APPDATA%\windows-server-search-mcp\config.json);
                              the user's .claude-policy file lives in the same folder
     #>
@@ -247,6 +251,9 @@ function Get-WssConfig {
         WriteAllowOverwrite = ConvertTo-WssBool (Pick 'WSS_WRITE_OVERWRITE' 'writeAllowOverwrite') $true
         WriteMaxMB     = ConvertTo-WssInt (Pick 'WSS_WRITE_MAX_MB' 'writeMaxMB') 100 1 102400
         WriteLogPath   = (Pick 'WSS_WRITE_LOG' 'writeLogPath')
+        UseIFilter     = ConvertTo-WssBool (Pick 'WSS_USE_IFILTER' 'useIFilter') $true
+        FilterTimeout  = ConvertTo-WssInt (Pick 'WSS_FILTER_TIMEOUT' 'filterTimeout') 60 1 600
+        DiscoveryTtl   = ConvertTo-WssInt (Pick 'WSS_DISCOVERY_TTL' 'discoveryTtl') 60 0 3600
         ConfigFile     = $path
         PolicyFile     = $(if ($path) { [IO.Path]::Combine([IO.Path]::GetDirectoryName($path), $script:PolicyFileName) })
     }
@@ -366,7 +373,25 @@ function Get-WssServerShares {
     }
 }
 
+$script:TargetCache = $null   # @{ Key; Time; Targets }
+
 function Get-WssTargets {
+    <# The searchable servers (see New-WssTargetList). Discovery runs CIM, registry and net view queries, so
+       the result is reused for DiscoveryTtl seconds while the settings stay the same; -Refresh rediscovers. #>
+    param([hashtable]$Config = (Get-WssConfig), [switch]$Refresh)
+    $ttl = 0
+    if ($Config.ContainsKey('DiscoveryTtl')) { $ttl = [int]$Config.DiscoveryTtl }
+    $key = (@("$($Config.AutoDiscover)", "$($Config.UseNetBios)") + @($Config.Servers) + @('|') + @($Config.Exclude)) -join "`n"
+    $c = $script:TargetCache
+    if (-not $Refresh -and $ttl -gt 0 -and $c -and $c.Key -ceq $key -and ([DateTime]::UtcNow - $c.Time).TotalSeconds -lt $ttl) {
+        return $c.Targets
+    }
+    $targets = @(New-WssTargetList -Config $Config)
+    $script:TargetCache = $(if ($ttl -gt 0) { @{ Key = $key; Time = [DateTime]::UtcNow; Targets = $targets } } else { $null })
+    return $targets
+}
+
+function New-WssTargetList {
     <#
       Builds the list of searchable servers:
       @{ Name; Machine; Sources=@('mapped-drive','config'); Shares=@(@{ Name; Unc; Drives=@('Z:') }) }
@@ -501,13 +526,25 @@ function Get-WssTermCondition {
 }
 
 function Format-WssSqlDate {
-    param([string]$Value, [string]$ParamName)
+    <# Index dates are UTC. A value with Z or an offset is exact; without one it is this PC's local time.
+       A plain date means that whole local day, so with -EndOfDay (modified_before) it includes the day. #>
+    param([string]$Value, [string]$ParamName, [switch]$EndOfDay)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $v = "$Value".Trim()
     $dt = [DateTime]::MinValue
-    $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
-    if (-not [DateTime]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$dt)) {
-        throw "Invalid date for ${ParamName}: '$Value' (use ISO 8601, e.g. 2024-05-31 or 2024-05-31T12:00:00Z)"
+    if ($v -match '^\d{4}-\d{2}-\d{2}$') {
+        $ok = [DateTime]::TryParseExact($v, 'yyyy-MM-dd', $inv, [Globalization.DateTimeStyles]::None, [ref]$dt)
+        if ($ok -and $EndOfDay) { $dt = $dt.AddDays(1).AddSeconds(-1) }
+        if ($ok) { $dt = [DateTime]::SpecifyKind($dt, [DateTimeKind]::Local).ToUniversalTime() }
+    } else {
+        $styles = [Globalization.DateTimeStyles]::AdjustToUniversal
+        if ($v -notmatch '(?i)(z|[+-]\d{2}(:?\d{2})?)$') { $styles = $styles -bor [Globalization.DateTimeStyles]::AssumeLocal }
+        $ok = [DateTime]::TryParse($v, $inv, $styles, [ref]$dt)
     }
-    return "'" + $dt.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + "'"
+    if (-not $ok) {
+        throw "Invalid date for ${ParamName}: '$Value' (use ISO 8601, e.g. 2024-05-31, 2024-05-31T12:00 or 2024-05-31T12:00:00Z)"
+    }
+    return "'" + $dt.ToString('yyyy-MM-dd HH:mm:ss', $inv) + "'"
 }
 
 function New-WssSearchSql {
@@ -574,7 +611,7 @@ function New-WssSearchSql {
     }
     if ($Author) { [void]$where.Add('System.Author = ' + (ConvertTo-WssSqlString $Author)) }
     if ($ModifiedAfter) { [void]$where.Add('System.DateModified >= ' + (Format-WssSqlDate $ModifiedAfter 'modified_after')) }
-    if ($ModifiedBefore) { [void]$where.Add('System.DateModified <= ' + (Format-WssSqlDate $ModifiedBefore 'modified_before')) }
+    if ($ModifiedBefore) { [void]$where.Add('System.DateModified <= ' + (Format-WssSqlDate $ModifiedBefore 'modified_before' -EndOfDay)) }
     if (-not $IncludeFolders) { [void]$where.Add("System.ItemType <> 'Directory'") }
 
     switch ($Sort) {
@@ -838,43 +875,28 @@ function Search-Wss {
     }
     $plans = @($plans | Where-Object { $_.Scopes.Count -gt 0 })
     if ($plans.Count -eq 0) { throw 'All matching shares are blocked by the access policy.' }
-    $hidden = 0
+    $offset = ConvertTo-WssInt $Arguments.offset 0 0 4500
+    $options = @{
+        Match = $match; Sort = $sort; Extensions = $exts
+        # One more than needed per server tells whether there is a next page.
+        Need = $offset + $limit + 1
+    }
+    $jobs = @(foreach ($plan in $plans) {
+            @{ Plan = $plan; Arguments = $Arguments; Options = $options; Targets = $Targets; Policy = $policy; Timeout = $Config.QueryTimeout; CompatLevels = $script:CompatLevel; RestoredEnv = @($script:RestoredEnv) }
+        })
+    $outcomes = @(Invoke-WssServerSearches -Jobs $jobs -TimeoutSeconds $Config.QueryTimeout)
 
+    $hidden = 0
     $results = New-Object System.Collections.ArrayList
     $errors = New-Object System.Collections.ArrayList
     $queried = @()
-    foreach ($plan in $plans) {
-        $srv = $plan.Server
-        $queried += $srv.Name
-        try {
-            # Fetch more than requested so blocked items do not crowd out allowed ones; widen once if needed.
-            $fetch = [Math]::Min($limit * 3 + 20, 2000)
-            for ($round = 0; $round -lt 2; $round++) {
-                $build = {
-                    param($compat)
-                    New-WssSearchSql -Machine $srv.Machine -Scopes $plan.Scopes -Query $Arguments.query -Match $match `
-                        -Extensions $exts -Kind $Arguments.kind -Author $Arguments.author `
-                        -ModifiedAfter $Arguments.modified_after -ModifiedBefore $Arguments.modified_before `
-                        -IncludeFolders (ConvertTo-WssBool $Arguments.include_folders $false) -Sort $sort -Top $fetch -Compat $compat
-                }
-                $rows = @(Invoke-WssCompatQuery -Machine $srv.Machine -BuildSql $build -TimeoutSeconds $Config.QueryTimeout)
-                $allowed = New-Object System.Collections.ArrayList
-                $hiddenHere = 0
-                foreach ($r in $rows) {
-                    $res = ConvertTo-WssResult $r $srv.Name $Targets
-                    if ($res.path -and (Test-WssBlocked $res.path $policy)) { $hiddenHere++; continue }
-                    [void]$allowed.Add($res)
-                }
-                if ($allowed.Count -ge $limit -or $rows.Count -lt $fetch -or $fetch -ge 5000) { break }
-                $fetch = [Math]::Min($fetch * 4, 5000)
-            }
-            $hidden += $hiddenHere
-            $i = 0
-            foreach ($res in $allowed) { if ($i -ge $limit) { break }; [void]$results.Add($res); $i++ }
-        } catch {
-            if ($_.Exception.Message -match '^Invalid ') { throw }
-            [void]$errors.Add([ordered]@{ server = $srv.Name; error = (Get-WssErrorMessage $_ $srv.Machine) })
-        }
+    foreach ($o in $outcomes) {
+        $queried += $o.Name
+        if ($null -ne $o.Compat) { $script:CompatLevel[$o.Machine] = $o.Compat }
+        if ($o.Invalid) { throw $o.Error }
+        if ($o.Error) { [void]$errors.Add([ordered]@{ server = $o.Name; error = $o.Error }); continue }
+        $hidden += $o.Hidden
+        foreach ($res in $o.Results) { [void]$results.Add($res) }
     }
 
     $sorted = @($results)
@@ -888,13 +910,21 @@ function Search-Wss {
             }
         }
     }
-    if ($sorted.Count -gt $limit) { $sorted = $sorted[0..($limit - 1)] }
+    $more = $sorted.Count -gt ($offset + $limit)
+    if ($offset -ge $sorted.Count) { $sorted = @() }
+    else { $sorted = @($sorted[$offset..([Math]::Min($sorted.Count, $offset + $limit) - 1)]) }
+
+    if ($Arguments.query -and (ConvertTo-WssBool $Arguments.snippets $false)) {
+        [void](Add-WssSnippets -Results $sorted -Query $Arguments.query -Config $Config -Targets $Targets -Policy $policy)
+    }
 
     $out = [ordered]@{
         servers_queried  = @($queried)
         result_count     = $sorted.Count
         hidden_by_policy = $hidden
     }
+    if ($offset -gt 0) { $out.offset = $offset }
+    if ($more) { $out.next_offset = $offset + $limit }
     if ($hidden -gt 0) {
         $out.policy_note = "$hidden matching file(s) were hidden from Claude by the access policy. Tell the user; do not try to access them another way."
     }
@@ -902,6 +932,111 @@ function Search-Wss {
     if ($errors.Count -gt 0) { $out.errors = @($errors) }
     if ($errors.Count -eq $plans.Count -and $plans.Count -gt 0) {
         throw ('All index queries failed: ' + (($errors | ForEach-Object { "$($_.server): $($_.error)" }) -join ' | '))
+    }
+    return $out
+}
+
+function Search-WssServer {
+    <# Runs the index query of one server and filters the hits by the access policy. Runs in the server's
+       own session or in a runspace of the search pool, so it never throws and only uses its parameters. #>
+    param($Plan, [hashtable]$Arguments, [hashtable]$Options, $Targets, $Policy, [int]$Timeout = 30, [hashtable]$CompatLevels, [string[]]$RestoredEnv)
+    if ($CompatLevels) { foreach ($k in @($CompatLevels.Keys)) { $script:CompatLevel[$k] = $CompatLevels[$k] } }
+    # For the error hints (a runspace has not seen the server's start-up).
+    if ($RestoredEnv) { $script:RestoredEnv = @($RestoredEnv) }
+    $srv = $Plan.Server
+    $out = @{ Name = $srv.Name; Machine = $srv.Machine; Results = @(); Hidden = 0; Error = $null; Invalid = $false; Compat = $null }
+    try {
+        $need = $Options.Need
+        # Fetch more than requested so blocked items do not crowd out allowed ones; widen if needed.
+        $fetch = [Math]::Min($need * 3 + 20, 2000)
+        while ($true) {
+            $build = {
+                param($compat)
+                New-WssSearchSql -Machine $srv.Machine -Scopes $Plan.Scopes -Query $Arguments.query -Match $Options.Match `
+                    -Extensions $Options.Extensions -Kind $Arguments.kind -Author $Arguments.author `
+                    -ModifiedAfter $Arguments.modified_after -ModifiedBefore $Arguments.modified_before `
+                    -IncludeFolders (ConvertTo-WssBool $Arguments.include_folders $false) -Sort $Options.Sort -Top $fetch -Compat $compat
+            }
+            $rows = @(Invoke-WssCompatQuery -Machine $srv.Machine -BuildSql $build -TimeoutSeconds $Timeout)
+            $allowed = New-Object System.Collections.ArrayList
+            $hidden = 0
+            foreach ($r in $rows) {
+                $res = ConvertTo-WssResult $r $srv.Name $Targets
+                if ($res.path -and (Test-WssBlocked $res.path $Policy)) { $hidden++; continue }
+                [void]$allowed.Add($res)
+            }
+            if ($allowed.Count -ge $need -or $rows.Count -lt $fetch -or $fetch -ge 5000) { break }
+            $fetch = [Math]::Min($fetch * 4, 5000)
+        }
+        $out.Hidden = $hidden
+        $out.Results = @($allowed | Select-Object -First $need)
+    } catch {
+        if ($_.Exception.Message -match '^Invalid ') { $out.Invalid = $true; $out.Error = $_.Exception.Message }
+        else { $out.Error = Get-WssErrorMessage $_ $srv.Machine }
+    }
+    if ($script:CompatLevel.ContainsKey($srv.Machine)) { $out.Compat = $script:CompatLevel[$srv.Machine] }
+    return $out
+}
+
+$script:ModulePath = $PSCommandPath
+$script:SearchPool = $null
+$script:FakeBackendPath = $null
+
+function Invoke-WssServerSearches {
+    <# Runs Search-WssServer for each job. Several servers are queried in parallel in a runspace pool, so one
+       slow or unreachable server costs one timeout instead of adding up. Test backends injected into this
+       session can't be used from other runspaces, so they run one after another (the fake backend file can). #>
+    param([array]$Jobs, [int]$TimeoutSeconds = 30)
+    $parallel = $Jobs.Count -gt 1 -and $script:ModulePath -and (-not $script:QueryExecutor -or $script:FakeBackendPath)
+    if ($parallel -and -not $script:SearchPool) {
+        try {
+            $iss = [Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+            # Execution policies exist only on Windows (elsewhere Open() fails when one is set).
+            if (Test-WssIsWindows) { $iss.ExecutionPolicy = 'Bypass' }
+            $iss.ImportPSModule(@($script:ModulePath))
+            $pool = [runspacefactory]::CreateRunspacePool(1, 8, $iss, $Host)
+            $pool.Open()
+            $script:SearchPool = $pool
+        } catch {
+            Write-WssLog "Parallel search unavailable, querying servers one after another: $($_.Exception.Message)"
+            $script:ModulePath = $null
+            $parallel = $false
+        }
+    }
+    if (-not $parallel) { return @(foreach ($j in $Jobs) { Search-WssServer @j }) }
+    $worker = {
+        param($Job, $FakeBackend)
+        if ($FakeBackend) { & (Get-Module WindowsServerSearch) { param($p) if (-not $script:FakeBackendPath) { Enable-WssFakeBackend $p } } $FakeBackend }
+        Search-WssServer @Job
+    }
+    $running = @(foreach ($j in $Jobs) {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $script:SearchPool
+            [void]$ps.AddScript($worker).AddArgument($j).AddArgument($script:FakeBackendPath)
+            @{ PS = $ps; Handle = $ps.BeginInvoke(); Job = $j }
+        })
+    # Each query has its own timeout; compat retries may run a few in a row.
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds * 2 + 15)
+    $out = @()
+    foreach ($r in $running) {
+        $srv = $r.Job.Plan.Server
+        $left = [int][Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if (-not $r.Handle.AsyncWaitHandle.WaitOne($left)) {
+            [void]$r.PS.BeginStop($null, $null)
+            $out += @{ Name = $srv.Name; Machine = $srv.Machine; Results = @(); Hidden = 0; Invalid = $false; Compat = $null
+                Error = "The index query on '$($srv.Machine)' did not answer in time. Narrow the search with 'path' or raise 'queryTimeout'." }
+            continue
+        }
+        $res = $null
+        try {
+            foreach ($o in $r.PS.EndInvoke($r.Handle)) { if ($null -ne $o -and $o.PSObject.BaseObject -is [hashtable]) { $res = $o.PSObject.BaseObject } }
+        } catch { Write-WssLog "Search on $($srv.Name) failed: $($_.Exception.Message)" }
+        if (-not $res) {
+            $msg = $(if ($r.PS.Streams.Error.Count -gt 0) { "$($r.PS.Streams.Error[0])" } else { 'no result' })
+            $res = @{ Name = $srv.Name; Machine = $srv.Machine; Results = @(); Hidden = 0; Invalid = $false; Compat = $null; Error = "Search failed: $msg" }
+        }
+        $r.PS.Dispose()
+        $out += $res
     }
     return $out
 }
@@ -932,7 +1067,7 @@ function Test-WssServer {
 
 function Get-WssServerList {
     param([hashtable]$Arguments, [hashtable]$Config = (Get-WssConfig))
-    $targets = @(Get-WssTargets -Config $Config)
+    $targets = @(Get-WssTargets -Config $Config -Refresh)
     $policy = Get-WssPolicy -Config $Config -Targets $targets
     $check = ConvertTo-WssBool $Arguments.check $false
     $list = @()
@@ -987,7 +1122,7 @@ function Resolve-WssPath {
         $rest = ''; if ($Matches.Count -gt 2 -and $Matches[2]) { $rest = $Matches[2] }
         $found = $null
         foreach ($srv in $Targets) { foreach ($sh in $srv.Shares) { if ($sh.Drives -contains $drive) { $found = $sh.Unc } } }
-        if (-not $found) { throw "Drive $drive is not a mapped drive of a known Windows server." }
+        if (-not $found) { throw "Drive $drive is not a mapped drive of a known Windows server. If it was mapped just now, call list_servers to refresh." }
         $p = $found + $rest
     }
     if ($p -match '^(?i)file:') { $p = (ConvertFrom-WssUncPath $p).Root + $(if ((ConvertFrom-WssUncPath $p).Rest) { '\' + (ConvertFrom-WssUncPath $p).Rest } else { '' }) }
@@ -1010,14 +1145,18 @@ function Resolve-WssPath {
             if ($norm -ieq $root -or $norm.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return $norm }
         }
     }
-    throw "Path '$Path' is outside the known Windows server shares. Use list_servers to see available shares."
+    throw "Path '$Path' is outside the known Windows server shares. Use list_servers to see (and refresh) the available shares."
 }
 
 function ConvertFrom-WssXmlText {
     param([string]$Xml, [string]$ParagraphTag, [string]$TextTag)
+    if (-not $Xml) { return '' }
     $s = $Xml
+    # Tracked deletions and field codes (TOC \o, HYPERLINK "...") are not part of the visible text.
+    # A self-closing <w:del .../> (deleted paragraph mark) has no content and must not start a match.
+    $s = $s -replace '(?s)<w:del\b[^>]*(?<!/)>.*?</w:del>', '' -replace '(?s)<w:instrText\b[^>]*(?<!/)>.*?</w:instrText>', ''
     if ($ParagraphTag) { $s = $s -replace "</$ParagraphTag>", "`n" }
-    $s = $s -replace '<w:tab/>', "`t" -replace '<w:br/>', "`n"
+    $s = $s -replace '<w:tab/>', "`t" -replace '<w:br/>', "`n" -replace '<w:cr/>', "`n" -replace '<a:br/>', "`n"
     $s = $s -replace '<[^>]+>', ''
     return [System.Net.WebUtility]::HtmlDecode($s)
 }
@@ -1030,74 +1169,596 @@ function Get-WssZipEntryText {
     try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
 }
 
+function Get-WssOoxmlRels {
+    <# Relationship id -> part name for an OOXML part, e.g. xl/workbook.xml: rId1 -> xl/worksheets/sheet1.xml #>
+    param($Zip, [string]$PartName)
+    $dir = ''; $file = $PartName
+    $slash = $PartName.LastIndexOf('/')
+    if ($slash -ge 0) { $dir = $PartName.Substring(0, $slash); $file = $PartName.Substring($slash + 1) }
+    $relsName = $(if ($dir) { "$dir/_rels/$file.rels" } else { "_rels/$file.rels" })
+    $map = @{}
+    $xml = Get-WssZipEntryText $Zip $relsName
+    if (-not $xml) { return $map }
+    foreach ($m in [regex]::Matches($xml, '<Relationship\b[^>]*>')) {
+        $id = [regex]::Match($m.Value, '\bId="([^"]*)"').Groups[1].Value
+        $target = [regex]::Match($m.Value, '\bTarget="([^"]*)"').Groups[1].Value
+        if (-not $id -or -not $target -or $m.Value -match 'TargetMode="External"') { continue }
+        if ($target.StartsWith('/')) { $path = $target.TrimStart('/') } else { $path = $(if ($dir) { "$dir/$target" } else { $target }) }
+        # Resolve ../ segments (pptx slides refer to ../notesSlides/...).
+        $parts = New-Object System.Collections.ArrayList
+        foreach ($seg in $path -split '/') {
+            if ($seg -eq '..') { if ($parts.Count -gt 0) { $parts.RemoveAt($parts.Count - 1) } } elseif ($seg -and $seg -ne '.') { [void]$parts.Add($seg) }
+        }
+        $map[$id] = ($parts -join '/')
+    }
+    return $map
+}
+
+function Get-WssNumberedParts {
+    <# Zip entries such as ppt/slides/slide12.xml in numeric order. #>
+    param($Zip, [string]$Pattern)
+    return @($Zip.Entries | Where-Object { $_.FullName -match $Pattern } |
+        Sort-Object { [int]([regex]::Match($_.FullName, '(\d+)\.xml$').Groups[1].Value) } | ForEach-Object { $_.FullName })
+}
+
+function ConvertFrom-WssWordXml {
+    <# Text of a WordprocessingML part. Table cells are separated by tabs, table rows by line breaks. #>
+    param([string]$Xml)
+    if (-not $Xml) { return '' }
+    $s = [regex]::Replace($Xml, '(?s)<w:tc\b[^>]*>(.*?)</w:tc>', {
+            param($m)
+            # Paragraphs inside a cell become spaces so the row stays on one line.
+            $cell = (ConvertFrom-WssXmlText ($m.Groups[1].Value -replace '</w:p>', ' ')) -replace '[\r\n\t]+', ' '
+            '<w:t>' + [System.Net.WebUtility]::HtmlEncode($cell.Trim()) + "`t</w:t>"
+        })
+    $s = $s -replace '</w:tr>', "`n"
+    return (ConvertFrom-WssXmlText $s 'w:p') -replace "`t`n", "`n"
+}
+
+function Get-WssDocxText {
+    param($Zip)
+    $sb = New-Object Text.StringBuilder
+    [void]$sb.AppendLine((ConvertFrom-WssWordXml (Get-WssZipEntryText $Zip 'word/document.xml')).Trim())
+    foreach ($kind in 'header', 'footer') {
+        $seen = @{}
+        foreach ($part in Get-WssNumberedParts $Zip "^word/$kind(\d+)\.xml$") {
+            $t = (ConvertFrom-WssWordXml (Get-WssZipEntryText $Zip $part)).Trim()
+            # Documents often repeat the same header in several sections.
+            if ($t -and -not $seen.ContainsKey($t)) { $seen[$t] = $true; [void]$sb.AppendLine("--- ${kind}: $t") }
+        }
+    }
+    foreach ($p in @(@{ Part = 'word/footnotes.xml'; Tag = 'w:footnote'; Label = 'Footnotes' }, @{ Part = 'word/endnotes.xml'; Tag = 'w:endnote'; Label = 'Endnotes' })) {
+        $xml = Get-WssZipEntryText $Zip $p.Part
+        if (-not $xml) { continue }
+        $notes = @()
+        foreach ($m in [regex]::Matches($xml, "(?s)<$($p.Tag)\b([^>]*)>(.*?)</$($p.Tag)>")) {
+            if ($m.Groups[1].Value -match 'w:type="(separator|continuationSeparator|continuationNotice)"') { continue }
+            $id = [regex]::Match($m.Groups[1].Value, 'w:id="(-?\d+)"').Groups[1].Value
+            $t = ((ConvertFrom-WssWordXml $m.Groups[2].Value) -replace '\s+', ' ').Trim()
+            if ($t) { $notes += "[$id] $t" }
+        }
+        if ($notes.Count -gt 0) { [void]$sb.AppendLine("--- $($p.Label) ---"); [void]$sb.AppendLine(($notes -join "`n")) }
+    }
+    $xml = Get-WssZipEntryText $Zip 'word/comments.xml'
+    if ($xml) {
+        $comments = @()
+        foreach ($m in [regex]::Matches($xml, '(?s)<w:comment\b([^>]*)>(.*?)</w:comment>')) {
+            $author = [System.Net.WebUtility]::HtmlDecode([regex]::Match($m.Groups[1].Value, 'w:author="([^"]*)"').Groups[1].Value)
+            $t = ((ConvertFrom-WssWordXml $m.Groups[2].Value) -replace '\s+', ' ').Trim()
+            if ($t) { $comments += $(if ($author) { "${author}: $t" } else { $t }) }
+        }
+        if ($comments.Count -gt 0) { [void]$sb.AppendLine('--- Comments ---'); [void]$sb.AppendLine(($comments -join "`n")) }
+    }
+    return $sb.ToString().Trim()
+}
+
+function Get-WssPptxText {
+    <# Slides in presentation order (presentation.xml), with speaker notes. #>
+    param($Zip)
+    $slides = @()
+    $pres = Get-WssZipEntryText $Zip 'ppt/presentation.xml'
+    if ($pres) {
+        $rels = Get-WssOoxmlRels $Zip 'ppt/presentation.xml'
+        foreach ($m in [regex]::Matches($pres, '<p:sldId\b[^>]*\br:id="([^"]*)"')) {
+            $part = $rels[$m.Groups[1].Value]
+            if ($part -and $Zip.GetEntry($part)) { $slides += $part }
+        }
+    }
+    if ($slides.Count -eq 0) { $slides = @(Get-WssNumberedParts $Zip '^ppt/slides/slide(\d+)\.xml$') }
+    $sb = New-Object Text.StringBuilder
+    $i = 0
+    foreach ($part in $slides) {
+        $i++
+        [void]$sb.AppendLine("--- Slide $i ---")
+        [void]$sb.AppendLine((ConvertFrom-WssXmlText (Get-WssZipEntryText $Zip $part) 'a:p').Trim())
+        $notesPart = $null
+        foreach ($target in (Get-WssOoxmlRels $Zip $part).Values) { if ($target -match '^ppt/notesSlides/') { $notesPart = $target } }
+        if ($notesPart) {
+            $nx = Get-WssZipEntryText $Zip $notesPart
+            # Only the notes body placeholder; the others hold the slide image and the slide number.
+            $body = @([regex]::Matches("$nx", '(?s)<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^>]*type="body"(?:(?!</p:sp>).)*</p:sp>') | ForEach-Object { $_.Value })
+            $notes = (ConvertFrom-WssXmlText ($body -join "`n") 'a:p').Trim()
+            if ($notes) { [void]$sb.AppendLine("Notes: $notes") }
+        }
+    }
+    return $sb.ToString().Trim()
+}
+
+function ConvertFrom-WssCellRef {
+    <# Zero-based column index of a cell reference such as AB12. #>
+    param([string]$Ref)
+    $col = 0
+    foreach ($ch in $Ref.ToUpperInvariant().ToCharArray()) {
+        if ($ch -lt 'A' -or $ch -gt 'Z') { break }
+        $col = $col * 26 + ([int]$ch - 64)
+    }
+    return ($col - 1)
+}
+
+function Get-WssXlsxNumberFormats {
+    <# Style index (the s attribute of a cell) -> 'date', 'time', 'datetime', 'elapsed', 'percent' or $null. #>
+    param($Zip)
+    $kinds = @{}
+    $xml = Get-WssZipEntryText $Zip 'xl/styles.xml'
+    if (-not $xml) { return $kinds }
+    $custom = @{}
+    foreach ($m in [regex]::Matches($xml, '<numFmt\b[^>]*>')) {
+        $id = [regex]::Match($m.Value, 'numFmtId="(\d+)"').Groups[1].Value
+        $code = [System.Net.WebUtility]::HtmlDecode([regex]::Match($m.Value, 'formatCode="([^"]*)"').Groups[1].Value)
+        if ($id) { $custom[[int]$id] = $code }
+    }
+    $xfs = [regex]::Match($xml, '(?s)<cellXfs\b[^>]*>(.*?)</cellXfs>').Groups[1].Value
+    $i = 0
+    foreach ($m in [regex]::Matches($xfs, '<xf\b[^>]*>')) {
+        $id = 0
+        [void][int]::TryParse([regex]::Match($m.Value, 'numFmtId="(\d+)"').Groups[1].Value, [ref]$id)
+        $kind = $null
+        if ($id -in 14, 15, 16, 17, 22) { $kind = $(if ($id -eq 22) { 'datetime' } else { 'date' }) }
+        elseif ($id -in 18, 19, 20, 21, 45, 47) { $kind = 'time' }
+        elseif ($id -eq 46) { $kind = 'elapsed' }
+        elseif ($id -in 27..36 -or $id -in 50..58) { $kind = 'date' }
+        elseif ($id -in 9, 10) { $kind = 'percent' }
+        elseif ($custom.ContainsKey($id)) {
+            # Ignore quoted literals, escapes, padding (_x, *x) and [Red]/[$-409] sections; [h]:mm is elapsed time.
+            $raw = $custom[$id].Split(';')[0].ToLowerInvariant()
+            $code = ($raw -replace '"[^"]*"', '' -replace '\\.', '' -replace '[_*].', '' -replace '\[[^\]]*\]', '')
+            $hasTime = $code -match '[hs]' -or $raw -match '\[(h+|m+|s+)\]'
+            $hasDate = $code -match '[dy]' -or ($code -match 'm' -and -not $hasTime)
+            if ($raw -match '\[(h+|m+|s+)\]' -and -not ($code -match '[dy]')) { $kind = 'elapsed' }
+            elseif ($hasDate -and $hasTime) { $kind = 'datetime' } elseif ($hasDate) { $kind = 'date' } elseif ($hasTime) { $kind = 'time' }
+            elseif ($code -match '%') { $kind = 'percent' }
+        }
+        $kinds[$i] = $kind
+        $i++
+    }
+    return $kinds
+}
+
+function Format-WssCellNumber {
+    param([string]$Value, [string]$Kind, [bool]$Date1904)
+    if (-not $Kind) { return $Value }
+    $d = 0.0
+    if (-not [double]::TryParse($Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $Value }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    if ($Kind -eq 'percent') { return ($d * 100).ToString('0.##', $inv) + '%' }
+    if ($Kind -eq 'elapsed') {
+        # [h]:mm durations: 1.5 days are 36:00:00, not a date.
+        $secs = [int64][Math]::Round([Math]::Abs($d) * 86400)
+        $sign = $(if ($d -lt 0) { '-' } else { '' })
+        return '{0}{1}:{2:00}:{3:00}' -f $sign, [Math]::Floor($secs / 3600), [Math]::Floor(($secs % 3600) / 60), ($secs % 60)
+    }
+    $base = $(if ($Date1904) { [datetime]'1904-01-01' } else { [datetime]'1899-12-30' })
+    if ($d -lt 0 -or $d -gt 2958465) { return $Value }
+    # Excel counts a 29 February 1900 that never existed; serials before it are one day later.
+    if (-not $Date1904 -and $d -lt 60) { $d += 1 }
+    # Whole seconds: serial numbers carry floating point noise (0.5 days may be 0.49999999).
+    $dt = $base.AddSeconds([Math]::Round($d * 86400))
+    switch ($Kind) {
+        'time' { return $dt.ToString('HH:mm:ss', $inv) }
+        'date' { if ($dt.TimeOfDay.Ticks -eq 0) { return $dt.ToString('yyyy-MM-dd', $inv) }; return $dt.ToString('yyyy-MM-dd HH:mm:ss', $inv) }
+        default { return $dt.ToString('yyyy-MM-dd HH:mm:ss', $inv) }
+    }
+}
+
+function Get-WssXlsxText {
+    <# One block per sheet (workbook order, real names); one line per row: row number, then the cells by
+       column, tab-separated. Empty cells keep their column, so values stay under their headers. #>
+    param($Zip)
+    $shared = New-Object System.Collections.ArrayList
+    $ssXml = Get-WssZipEntryText $Zip 'xl/sharedStrings.xml'
+    if ($ssXml) {
+        foreach ($m in [regex]::Matches($ssXml, '(?s)<si\b[^>]*?(?:/>|>(.*?)</si>)')) {
+            [void]$shared.Add([System.Net.WebUtility]::HtmlDecode(($m.Groups[1].Value -replace '(?s)<rPh\b.*?</rPh>', '' -replace '<[^>]+>', '')))
+        }
+    }
+    $formats = Get-WssXlsxNumberFormats $Zip
+    $sheets = @()
+    $wb = Get-WssZipEntryText $Zip 'xl/workbook.xml'
+    $date1904 = $false
+    if ($wb) {
+        $date1904 = $wb -match '<workbookPr\b[^>]*date1904="(1|true)"'
+        $rels = Get-WssOoxmlRels $Zip 'xl/workbook.xml'
+        foreach ($m in [regex]::Matches($wb, '<sheet\b[^>]*>')) {
+            $name = [System.Net.WebUtility]::HtmlDecode([regex]::Match($m.Value, '\bname="([^"]*)"').Groups[1].Value)
+            $part = $rels[[regex]::Match($m.Value, '\br:id="([^"]*)"').Groups[1].Value]
+            $state = [regex]::Match($m.Value, '\bstate="([^"]*)"').Groups[1].Value
+            if ($part -and $Zip.GetEntry($part)) { $sheets += @{ Name = $name; Part = $part; Hidden = ($state -match 'hidden') } }
+        }
+    }
+    if ($sheets.Count -eq 0) {
+        foreach ($part in Get-WssNumberedParts $Zip '^xl/worksheets/sheet(\d+)\.xml$') {
+            $sheets += @{ Name = [IO.Path]::GetFileNameWithoutExtension($part); Part = $part; Hidden = $false }
+        }
+    }
+    $sb = New-Object Text.StringBuilder
+    foreach ($sheet in $sheets) {
+        $xml = Get-WssZipEntryText $Zip $sheet.Part
+        $header = "--- Sheet: $($sheet.Name)"
+        if ($sheet.Hidden) { $header += ' (hidden)' }
+        $dim = [regex]::Match("$xml", '<dimension\b[^>]*\bref="([^"]*)"').Groups[1].Value
+        if ($dim) { $header += " [$dim]" }
+        [void]$sb.AppendLine("$header ---")
+        $rowNum = 0
+        foreach ($row in [regex]::Matches("$xml", '(?s)<row\b([^>]*?)(?:/>|>(.*?)</row>)')) {
+            $r = [regex]::Match($row.Groups[1].Value, '\br="(\d+)"').Groups[1].Value
+            if ($r) { $rowNum = [int]$r } else { $rowNum++ }
+            $cells = New-Object System.Collections.ArrayList
+            $next = 0
+            foreach ($c in [regex]::Matches($row.Groups[2].Value, '(?s)<c\b([^>]*?)(?:/>|>(.*?)</c>)')) {
+                $attrs = $c.Groups[1].Value
+                $inner = $c.Groups[2].Value
+                $ref = [regex]::Match($attrs, '\br="([A-Za-z]+)\d*"').Groups[1].Value
+                $col = $(if ($ref) { ConvertFrom-WssCellRef $ref } else { $next })
+                $type = [regex]::Match($attrs, '\bt="([^"]*)"').Groups[1].Value
+                $v = [System.Net.WebUtility]::HtmlDecode([regex]::Match($inner, '(?s)<v>(.*?)</v>').Groups[1].Value)
+                switch ($type) {
+                    's' { if ($v -match '^\d+$' -and [int]$v -lt $shared.Count) { $v = $shared[[int]$v] } }
+                    'inlineStr' { $v = [System.Net.WebUtility]::HtmlDecode(($inner -replace '(?s)<rPh\b.*?</rPh>', '' -replace '<[^>]+>', '')) }
+                    'b' { $v = $(if ($v -eq '1') { 'TRUE' } elseif ($v -eq '0') { 'FALSE' } else { $v }) }
+                    { $_ -in 'str', 'e' } { }
+                    default {
+                        $s = [regex]::Match($attrs, '\bs="(\d+)"').Groups[1].Value
+                        if ($v -and $s -and $formats.ContainsKey([int]$s)) { $v = Format-WssCellNumber $v $formats[[int]$s] $date1904 }
+                    }
+                }
+                $v = ($v -replace '[\t\r\n]+', ' ')
+                while ($cells.Count -lt $col) { [void]$cells.Add('') }
+                if ($cells.Count -eq $col) { [void]$cells.Add($v) } else { $cells[$col] = $v }
+                $next = $col + 1
+            }
+            while ($cells.Count -gt 0 -and $cells[$cells.Count - 1] -eq '') { $cells.RemoveAt($cells.Count - 1) }
+            if ($cells.Count -eq 0) { continue }
+            [void]$sb.AppendLine("$rowNum`t" + ($cells -join "`t"))
+        }
+    }
+    return $sb.ToString().Trim()
+}
+
 function Get-WssDocumentText {
-    <# Extracts readable text from plain-text files and Office Open XML documents. #>
-    param([string]$LiteralPath)
+    <# Extracts readable text from plain-text files, Office Open XML documents and, through the Windows
+       IFilter of the file type, other formats such as PDF, .doc, .rtf or .msg. #>
+    param([string]$LiteralPath, [hashtable]$Config = @{})
     $ext = [IO.Path]::GetExtension($LiteralPath).ToLowerInvariant()
-    if ($ext -in @('.docx', '.docm', '.pptx', '.pptm', '.xlsx', '.xlsm')) {
+    if ($ext -in @('.docx', '.docm', '.dotx', '.dotm', '.pptx', '.pptm', '.ppsx', '.potx', '.xlsx', '.xlsm', '.xltx', '.xltm')) {
         Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
         Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
         $fs = [IO.File]::Open($LiteralPath, 'Open', 'Read', 'ReadWrite')
-        $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Read)
         try {
-            if ($ext -like '.doc*') {
-                return (ConvertFrom-WssXmlText (Get-WssZipEntryText $zip 'word/document.xml') 'w:p').Trim()
-            }
-            if ($ext -like '.ppt*') {
-                $slides = @($zip.Entries | Where-Object { $_.FullName -match '^ppt/slides/slide(\d+)\.xml$' } |
-                    Sort-Object { [int]([regex]::Match($_.FullName, '(\d+)\.xml$').Groups[1].Value) })
-                $sb = New-Object Text.StringBuilder
-                $i = 0
-                foreach ($s in $slides) {
-                    $i++
-                    [void]$sb.AppendLine("--- Slide $i ---")
-                    [void]$sb.AppendLine((ConvertFrom-WssXmlText (Get-WssZipEntryText $zip $s.FullName) 'a:p').Trim())
-                }
-                return $sb.ToString().Trim()
-            }
-            # xlsx: resolve shared strings, emit one tab-separated line per row
-            $shared = @()
-            $ssXml = Get-WssZipEntryText $zip 'xl/sharedStrings.xml'
-            if ($ssXml) {
-                foreach ($m in [regex]::Matches($ssXml, '<si>(.*?)</si>', 'Singleline')) {
-                    $shared += [System.Net.WebUtility]::HtmlDecode(($m.Groups[1].Value -replace '<rPh.*?</rPh>', '' -replace '<[^>]+>', ''))
-                }
-            }
-            $sheets = @($zip.Entries | Where-Object { $_.FullName -match '^xl/worksheets/sheet(\d+)\.xml$' } |
-                Sort-Object { [int]([regex]::Match($_.FullName, '(\d+)\.xml$').Groups[1].Value) })
-            $sb = New-Object Text.StringBuilder
-            foreach ($sheet in $sheets) {
-                [void]$sb.AppendLine("--- $([IO.Path]::GetFileNameWithoutExtension($sheet.FullName)) ---")
-                $xml = Get-WssZipEntryText $zip $sheet.FullName
-                foreach ($row in [regex]::Matches($xml, '<row[^>]*>(.*?)</row>', 'Singleline')) {
-                    $cells = @()
-                    foreach ($c in [regex]::Matches($row.Groups[1].Value, '<c([^>]*?)(?:/>|>(.*?)</c>)', 'Singleline')) {
-                        $attrs = $c.Groups[1].Value
-                        $inner = $c.Groups[2].Value
-                        $v = [regex]::Match($inner, '<v>(.*?)</v>', 'Singleline').Groups[1].Value
-                        if ($attrs -match 't="s"' -and $v -match '^\d+$' -and [int]$v -lt $shared.Count) { $v = $shared[[int]$v] }
-                        elseif ($attrs -match 't="inlineStr"') { $v = ($inner -replace '<[^>]+>', '') }
-                        $cells += [System.Net.WebUtility]::HtmlDecode($v)
-                    }
-                    [void]$sb.AppendLine(($cells -join "`t"))
-                }
-            }
-            return $sb.ToString().Trim()
-        } finally {
-            $zip.Dispose(); $fs.Dispose()
-        }
+            try { $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Read) }
+            catch { throw "'$LiteralPath' is not a valid Office document (it may be password-protected or damaged)." }
+            try {
+                if ($ext -like '.do*') { return Get-WssDocxText $zip }
+                if ($ext -like '.p*') { return Get-WssPptxText $zip }
+                return Get-WssXlsxText $zip
+            } finally { $zip.Dispose() }
+        } finally { $fs.Dispose() }
+    }
+    $useIFilter = ConvertTo-WssBool $Config.UseIFilter $true
+    $filterTimeout = ConvertTo-WssInt $Config.FilterTimeout 60 1 600
+    # Formats that look like text but read far better through their filter (RTF control words, MIME parts).
+    if ($useIFilter -and $ext -in $script:IFilterFirstExtensions) {
+        $t = Get-WssIFilterText -LiteralPath $LiteralPath -Optional -TimeoutSeconds $filterTimeout
+        if ($null -ne $t) { return $t }
     }
     $bytes = [IO.File]::ReadAllBytes($LiteralPath)
     $probe = [Math]::Min($bytes.Length, 8000)
+    $binary = $false
     for ($i = 0; $i -lt $probe; $i++) {
         if ($bytes[$i] -eq 0) {
             # UTF-16 files contain NULs too; detect by BOM.
             if ($bytes.Length -ge 2 -and (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF))) { break }
-            throw "'$LiteralPath' looks like a binary file ($ext). Only text files and .docx/.xlsx/.pptx can be read."
+            $binary = $true; break
         }
+    }
+    if ($binary -or ($bytes.Length -ge 5 -and [Text.Encoding]::ASCII.GetString($bytes, 0, 5) -eq '%PDF-')) {
+        $plain = "Text files and .docx/.xlsx/.pptx can always be read; use copy_file to work with this file in the workspace."
+        if (-not $useIFilter) { throw "'$LiteralPath' is a binary file ($ext) and reading other formats through Windows filters is disabled (useIFilter). $plain" }
+        if (-not (Test-WssIsWindows) -and -not $script:IFilterExtractor) { throw "'$LiteralPath' looks like a binary file ($ext). $plain" }
+        return Get-WssIFilterText -LiteralPath $LiteralPath -TimeoutSeconds $filterTimeout
     }
     $sr = New-Object IO.StreamReader((New-Object IO.MemoryStream(, $bytes)), (New-Object Text.UTF8Encoding($false)), $true)
     try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+}
+
+# ---------------------------------------------------------------------------
+# Windows filters (IFilter): the components Windows Search itself uses to read PDF, .doc, .rtf, .msg, ...
+# ---------------------------------------------------------------------------
+
+$script:IFilterFirstExtensions = @('.rtf', '.eml', '.mht', '.mhtml')
+$script:IFilterMaxChars = 5000000
+$script:IFilterExtractor = $null   # scriptblock: param($Path, $MaxChars, $TimeoutMs) -> @{ Text; NoFilter; HResult; Truncated } (tests)
+$script:IFilterLoaded = $false
+# C# 5 (Windows PowerShell 5.1 compiles with the .NET Framework compiler).
+$script:IFilterSource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+namespace WssIFilter {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROPSPEC { public uint ulKind; public IntPtr data; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FULLPROPSPEC { public Guid guidPropSet; public PROPSPEC psProperty; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct STAT_CHUNK {
+        public uint idChunk; public int breakType; public int flags; public uint locale;
+        public FULLPROPSPEC attribute; public uint idChunkSource; public uint cwcStartSource; public uint cwcLenSource;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILTERREGION { public uint idChunk; public uint cwcStart; public uint cwcExtent; }
+
+    [ComImport, Guid("89BCB740-6119-101A-BCB7-00DD010655AF"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IFilter {
+        [PreserveSig] int Init(uint grfFlags, uint cAttributes, IntPtr aAttributes, out uint pdwFlags);
+        [PreserveSig] int GetChunk(out STAT_CHUNK pStat);
+        [PreserveSig] int GetText(ref uint pcwcBuffer, IntPtr awcBuffer);
+        [PreserveSig] int GetValue(out IntPtr ppPropValue);
+        [PreserveSig] int BindRegion(FILTERREGION origPos, ref Guid riid, out IntPtr ppunk);
+    }
+
+    public class Result {
+        public string Text;
+        public bool NoFilter;
+        public int HResult;
+        public bool Truncated;
+    }
+
+    public static class Extractor {
+        [DllImport("query.dll", CharSet = CharSet.Unicode)]
+        static extern int LoadIFilter(string pwcsPath, IntPtr pUnkOuter, out IntPtr ppIUnk);
+
+        const int FILTER_E_END_OF_CHUNKS = unchecked((int)0x80041700);
+        const int FILTER_E_NO_MORE_TEXT = unchecked((int)0x80041701);
+        const int FILTER_E_NO_TEXT = unchecked((int)0x80041705);
+        const int FILTER_E_EMBEDDING_UNAVAILABLE = unchecked((int)0x80041707);
+        const int FILTER_E_LINK_UNAVAILABLE = unchecked((int)0x80041708);
+        const int FILTER_S_LAST_TEXT = 0x00041709;
+        const int CHUNK_TEXT = 1;
+        const uint BUFFER_CHARS = 8192;
+        static readonly Guid StorageProps = new Guid("B725F130-47EF-101A-A5F1-02608C9EEBAC");
+
+        // Runs the filter on its own STA thread (some filters require STA) and gives up after timeoutMs,
+        // so a hanging filter can't block the server.
+        public static Result Extract(string path, int maxChars, int timeoutMs) {
+            Result result = null;
+            Exception error = null;
+            Thread t = new Thread(delegate() {
+                try { result = Run(path, maxChars); } catch (Exception e) { error = e; }
+            });
+            t.IsBackground = true;
+            t.SetApartmentState(ApartmentState.STA);
+            t.Start();
+            if (!t.Join(timeoutMs)) throw new TimeoutException("The Windows filter did not finish within " + (timeoutMs / 1000) + " seconds.");
+            if (error != null) throw error;
+            return result;
+        }
+
+        static Result Run(string path, int maxChars) {
+            Result r = new Result();
+            IntPtr unk;
+            int hr = LoadIFilter(path, IntPtr.Zero, out unk);
+            if (hr != 0 || unk == IntPtr.Zero) { r.NoFilter = true; r.HResult = hr; return r; }
+            IFilter filter = null;
+            IntPtr buf = Marshal.AllocCoTaskMem((int)(BUFFER_CHARS + 2) * 2);
+            try {
+                filter = (IFilter)Marshal.GetObjectForIUnknown(unk);
+                uint flags;
+                // canonical paragraphs, hard line breaks, canonical hyphens and spaces, index attributes
+                hr = filter.Init(1 | 2 | 4 | 8 | 16, 0, IntPtr.Zero, out flags);
+                if (hr < 0) { r.HResult = hr; return r; }
+                StringBuilder sb = new StringBuilder();
+                while (!r.Truncated) {
+                    STAT_CHUNK chunk;
+                    hr = filter.GetChunk(out chunk);
+                    if (hr == FILTER_E_END_OF_CHUNKS) break;
+                    if (hr == FILTER_E_EMBEDDING_UNAVAILABLE || hr == FILTER_E_LINK_UNAVAILABLE) continue;
+                    if (hr < 0) { if (sb.Length == 0) r.HResult = hr; break; }
+                    if ((chunk.flags & CHUNK_TEXT) == 0) continue;
+                    // Only the document body (System.Contents), not title, author and other properties.
+                    if (chunk.attribute.guidPropSet == StorageProps && chunk.attribute.psProperty.ulKind == 1 && chunk.attribute.psProperty.data.ToInt64() != 19) continue;
+                    if (sb.Length > 0) {
+                        char last = sb[sb.Length - 1];
+                        if (chunk.breakType == 3 || chunk.breakType == 4) { if (last != '\n') sb.Append('\n'); }
+                        else if (chunk.breakType == 1 || chunk.breakType == 2) { if (!char.IsWhiteSpace(last)) sb.Append(' '); }
+                    }
+                    while (true) {
+                        uint len = BUFFER_CHARS;
+                        hr = filter.GetText(ref len, buf);
+                        if (hr < 0) break;
+                        if (len > BUFFER_CHARS) len = BUFFER_CHARS;
+                        if (len > 0) sb.Append(Marshal.PtrToStringUni(buf, (int)len));
+                        if (sb.Length >= maxChars) { r.Truncated = true; break; }
+                        if (hr == FILTER_S_LAST_TEXT) break;
+                    }
+                }
+                if (sb.Length > maxChars) sb.Length = maxChars;
+                r.Text = sb.ToString().Replace("\r\n", "\n").Replace('\r', '\n');
+                return r;
+            } finally {
+                Marshal.FreeCoTaskMem(buf);
+                if (filter != null) Marshal.ReleaseComObject(filter);
+                Marshal.Release(unk);
+            }
+        }
+    }
+}
+'@
+
+function Get-WssIFilterText {
+    <# Text of a file through the IFilter registered for its type on this PC. With -Optional, returns $null
+       instead of failing (used for text formats that also read acceptably as plain text). #>
+    param([string]$LiteralPath, [switch]$Optional, [int]$TimeoutSeconds = 60)
+    $ext = [IO.Path]::GetExtension($LiteralPath).ToLowerInvariant()
+    $copyHint = 'Use copy_file to work with the file in the workspace instead.'
+    try {
+        if ($script:IFilterExtractor) {
+            $r = & $script:IFilterExtractor $LiteralPath $script:IFilterMaxChars ($TimeoutSeconds * 1000)
+        } else {
+            if (-not (Test-WssIsWindows)) { throw 'Windows filters are only available on Windows.' }
+            if (-not $script:IFilterLoaded) {
+                Add-Type -TypeDefinition $script:IFilterSource -Language CSharp -ErrorAction Stop
+                $script:IFilterLoaded = $true
+            }
+            $r = [WssIFilter.Extractor]::Extract($LiteralPath, $script:IFilterMaxChars, $TimeoutSeconds * 1000)
+        }
+    } catch {
+        $inner = $_.Exception
+        while ($inner.InnerException) { $inner = $inner.InnerException }
+        Write-WssLog "IFilter for '$LiteralPath' failed: $($inner.Message)"
+        if ($Optional) { return $null }
+        throw "Reading '$LiteralPath' through its Windows filter failed: $($inner.Message) $copyHint"
+    }
+    if ($r.NoFilter) {
+        if ($Optional) { return $null }
+        $pdf = $(if ($ext -eq '.pdf') { ' PDF text needs a PDF filter, which Adobe Acrobat Reader and other PDF readers install.' } else { '' })
+        throw "No Windows filter (IFilter) for $ext files is installed on this PC, so the text of '$LiteralPath' can't be read here.$pdf $copyHint"
+    }
+    $text = "$($r.Text)"
+    if ($r.HResult -ne 0 -and -not $text) {
+        if ($Optional) { return $null }
+        throw ("The Windows filter for $ext files could not read '$LiteralPath' (error 0x{0:X8}); it may be password-protected or damaged. $copyHint" -f $r.HResult)
+    }
+    if (-not $text.Trim()) {
+        if ($Optional) { return $null }
+        throw "No text found in '$LiteralPath'. It may be a scanned document or an image without a text layer. $copyHint"
+    }
+    if ($r.Truncated) { $text += "`n[... text truncated after $($script:IFilterMaxChars) characters]" }
+    return $text
+}
+
+# ASCII source only: Windows PowerShell 5.1 reads BOM-less scripts in the ANSI code page.
+$script:Ellipsis = [string][char]0x2026
+
+function New-WssFindRegex {
+    <# Case-insensitive regex for "phrase" or "a OR b"; whitespace in a phrase also matches line breaks. #>
+    param([string]$Find, [switch]$Prefix)
+    $alts = @()
+    foreach ($part in ($Find -split '\s+OR\s+')) {
+        $p = $part.Trim().Trim('"').Trim()
+        if (-not $p) { continue }
+        $rx = ([regex]::Escape($p) -replace '(\\ |\\t|\\n|\\r)+', '\s+')
+        if ($Prefix -and $p -match '^\w') { $rx = '\b' + $rx }
+        $alts += $rx
+    }
+    if ($alts.Count -eq 0) { return $null }
+    return New-Object regex(($alts -join '|'), ([Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::CultureInvariant))
+}
+
+function Find-WssPassages {
+    <# Passages around each match: the matching line plus $Context lines before and after; overlapping
+       passages are merged. Very long lines (one-line PDFs, spreadsheets) are cut around the match. #>
+    param([string]$Text, [string]$Find, [int]$Context = 2, [int]$MaxPassages = 20, [int]$MaxPassageChars = 1500)
+    $rx = New-WssFindRegex $Find
+    if (-not $rx) { throw 'find must contain a word or phrase.' }
+    $hits = $rx.Matches($Text)
+    $starts = New-Object System.Collections.Generic.List[int]
+    $starts.Add(0)
+    for ($i = $Text.IndexOf("`n"); $i -ge 0; $i = $Text.IndexOf("`n", $i + 1)) { $starts.Add($i + 1) }
+    $lineOf = {
+        param([int]$pos)
+        $idx = $starts.BinarySearch($pos)
+        if ($idx -lt 0) { $idx = (-bnot $idx) - 1 }
+        return $idx
+    }
+    $lineEnd = {
+        param([int]$line)
+        if ($line + 1 -lt $starts.Count) { return $starts[$line + 1] - 1 }
+        return $Text.Length
+    }
+    $passages = New-Object System.Collections.ArrayList
+    $cur = $null
+    $truncated = $false
+    foreach ($m in $hits) {
+        $line = & $lineOf $m.Index
+        $first = [Math]::Max(0, $line - $Context)
+        $last = [Math]::Min($starts.Count - 1, (& $lineOf ($m.Index + [Math]::Max(0, $m.Length - 1))) + $Context)
+        $from = $starts[$first]
+        $to = & $lineEnd $last
+        $cut = $false
+        if ($to - $from -gt $MaxPassageChars) {
+            $half = [int](($MaxPassageChars - $m.Length) / 2)
+            $from = [Math]::Max($starts[$line], $m.Index - [Math]::Max(100, $half))
+            $to = [Math]::Min($Text.Length, $m.Index + $m.Length + [Math]::Max(100, $half))
+            $cut = $true
+        }
+        if ($cur -and $from -le $cur.To + 1 -and ($to - $cur.From) -le $MaxPassageChars * 2) {
+            if ($to -gt $cur.To) { $cur.To = $to }
+            $cur.Cut = $cur.Cut -or $cut
+            continue
+        }
+        if ($passages.Count -ge $MaxPassages) { $truncated = $true; break }
+        $cur = @{ From = $from; To = $to; Line = (& $lineOf $from) + 1; Cut = $cut }
+        [void]$passages.Add($cur)
+    }
+    $out = @()
+    foreach ($p in $passages) {
+        $t = $Text.Substring($p.From, $p.To - $p.From).Trim("`r", "`n") -replace "`r", ''
+        if ($p.Cut) {
+            if ($p.From -gt 0 -and $Text[$p.From - 1] -ne "`n") { $t = $script:Ellipsis + $t }
+            if ($p.To -lt $Text.Length -and $Text[$p.To] -ne "`n") { $t += $script:Ellipsis }
+        }
+        $out += [ordered]@{ line = $p.Line; offset = $p.From; text = $t }
+    }
+    return @{ MatchCount = $hits.Count; Passages = $out; Truncated = $truncated }
+}
+
+$script:SnippetSkipExtensions = @('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.heic', '.webp', '.ico', '.svgz',
+    '.mp3', '.wav', '.wma', '.m4a', '.flac', '.mp4', '.mov', '.avi', '.mkv', '.wmv', '.zip', '.7z', '.rar', '.gz', '.tar',
+    '.cab', '.iso', '.vhd', '.vhdx', '.exe', '.dll', '.msi', '.sys', '.bin', '.dat', '.db', '.mdb', '.accdb', '.pst', '.ost')
+
+function Add-WssSnippets {
+    <# Adds "snippet" (text around the first query match) to the first results by reading their text,
+       within a time budget. The index itself has no reliable snippet column for remote queries. #>
+    param($Results, [string]$Query, [hashtable]$Config, $Targets, $Policy, [int]$Max = 10, [int]$BudgetMs = 15000)
+    $words = @(Get-WssQueryTerms $Query | Where-Object { -not $_.Exclude } | ForEach-Object { $_.Text })
+    if ($words.Count -eq 0) { return 0 }
+    $rx = New-WssFindRegex ($words -join ' OR ') -Prefix
+    # A slow filter (large PDF) must not use up the whole budget.
+    $cfg = $Config.Clone()
+    $cfg.FilterTimeout = [Math]::Min(10, (ConvertTo-WssInt $Config.FilterTimeout 60 1 600))
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $done = 0
+    foreach ($res in @($Results | Select-Object -First $Max)) {
+        if ($sw.ElapsedMilliseconds -gt $BudgetMs) { break }
+        if (-not $res.path) { continue }
+        $ext = [IO.Path]::GetExtension("$($res.path)").ToLowerInvariant()
+        if ($ext -in $script:SnippetSkipExtensions -or ($res.Contains('size') -and $res.size -gt 20MB)) { continue }
+        try {
+            Assert-WssAllowed $res.path $Policy -CheckFinalPath
+            $text = Get-WssDocumentText -LiteralPath $res.path -Config $cfg
+        } catch { continue }
+        $m = $rx.Match($text)
+        if (-not $m.Success) { continue }
+        $from = [Math]::Max(0, $m.Index - 120)
+        $to = [Math]::Min($text.Length, $m.Index + $m.Length + 180)
+        $s = ($text.Substring($from, $to - $from) -replace '\s+', ' ').Trim()
+        if ($from -gt 0) { $s = $script:Ellipsis + $s }
+        if ($to -lt $text.Length) { $s += $script:Ellipsis }
+        $res.snippet = $s
+        $done++
+    }
+    return $done
 }
 
 function Read-WssFile {
@@ -1109,7 +1770,26 @@ function Read-WssFile {
     $item = Get-Item -LiteralPath $unc
     $maxBytes = 50MB
     if ($item.Length -gt $maxBytes) { throw "File is too large to read ($($item.Length) bytes)." }
-    $text = Get-WssDocumentText -LiteralPath $unc
+    $text = Get-WssDocumentText -LiteralPath $unc -Config $Config
+    if ("$($Arguments.find)".Trim()) {
+        $found = Find-WssPassages -Text $text -Find "$($Arguments.find)" `
+            -Context (ConvertTo-WssInt $Arguments.context 2 0 20) -MaxPassages (ConvertTo-WssInt $Arguments.max_matches 20 1 200)
+        $out = [ordered]@{
+            path        = $unc
+            size_bytes  = [int64]$item.Length
+            modified    = ConvertTo-WssIso $item.LastWriteTime
+            total_chars = $text.Length
+            find        = "$($Arguments.find)"
+            match_count = $found.MatchCount
+        }
+        $drivePath = Convert-WssUncToDrivePath $unc $Targets
+        if ($drivePath) { $out.drive_path = $drivePath }
+        $out.passages = @($found.Passages)
+        $out.passages_truncated = $found.Truncated
+        if ($found.MatchCount -gt 0) { $out.hint = 'Each passage starts at "offset" (line "line"); call read_file with that offset to read on from there.' }
+        else { $out.hint = 'No matches. Matching ignores case and line breaks; try fewer or other words, or "a OR b".' }
+        return $out
+    }
     $offset = ConvertTo-WssInt $Arguments.offset 0 0 ([int]::MaxValue)
     $max = ConvertTo-WssInt $Arguments.max_chars 20000 1 200000
     $total = $text.Length
@@ -2172,10 +2852,67 @@ function Save-WssFiles {
 # MCP protocol
 # ---------------------------------------------------------------------------
 
+function Test-WssStructuredOutput {
+    <# Structured tool output (outputSchema / structuredContent) exists since protocol 2025-06-18. #>
+    return ($script:ProtocolVersion -and [string]::CompareOrdinal("$script:ProtocolVersion", '2025-06-18') -ge 0)
+}
+
+function Get-WssOutputSchemas {
+    <# Output schemas of the tools. Kept open (extra fields allowed) and typed only where a value is always
+       present, so clients that validate results never reject a real one. #>
+    $obj = @{ type = 'object' }
+    $arr = @{ type = 'array'; items = $obj }
+    $str = @{ type = 'string' }
+    $int = @{ type = 'integer' }
+    $bool = @{ type = 'boolean' }
+    $result = [ordered]@{
+        type       = 'object'
+        properties = [ordered]@{
+            name       = @{ type = @('string', 'null') }
+            path       = @{ type = @('string', 'null'); description = 'UNC path' }
+            drive_path = @{ type = 'string'; description = 'Path on the mapped drive, when there is one' }
+            server     = $str
+            size       = $int
+            modified   = @{ type = 'string'; description = 'UTC, ISO 8601' }
+            snippet    = @{ type = 'string'; description = 'Text around the first match (snippets=true)' }
+        }
+    }
+    return @{
+        list_servers   = [ordered]@{ type = 'object'; properties = [ordered]@{ servers = $arr; config = $obj; access_policy = $obj; write = $obj; hint = $str }; required = @('servers') }
+        search_files   = [ordered]@{
+            type       = 'object'
+            properties = [ordered]@{
+                servers_queried  = @{ type = 'array'; items = $str }
+                result_count     = $int
+                hidden_by_policy = $int
+                offset           = $int
+                next_offset      = @{ type = 'integer'; description = 'Pass as offset to get the next page' }
+                policy_note      = $str
+                results          = @{ type = 'array'; items = $result }
+                errors           = $arr
+            }
+            required   = @('result_count', 'hidden_by_policy', 'results')
+        }
+        read_file      = [ordered]@{
+            type       = 'object'
+            properties = [ordered]@{
+                path = $str; drive_path = $str; size_bytes = $int; modified = $str; total_chars = $int
+                offset = $int; returned = $int; truncated = $bool; next_offset = $int; content = $str
+                find = $str; match_count = $int; passages_truncated = $bool; hint = $str
+                passages = @{ type = 'array'; items = [ordered]@{ type = 'object'; properties = [ordered]@{ line = $int; offset = $int; text = $str } } }
+            }
+            required   = @('path', 'total_chars')
+        }
+        list_directory = [ordered]@{ type = 'object'; properties = [ordered]@{ path = $str; drive_path = $str; entries = $arr; truncated = $bool; hidden_by_policy = $int }; required = @('path', 'entries') }
+        copy_file      = [ordered]@{ type = 'object'; properties = [ordered]@{ destination = $str; destination_source = $str; copied = $arr; errors = $arr; note = $str }; required = @('copied') }
+        save_file      = [ordered]@{ type = 'object'; properties = [ordered]@{ destination = $str; destination_drive_path = $str; saved = $arr; errors = $arr; notes = @{ type = 'array'; items = $str }; log = $str }; required = @('saved') }
+    }
+}
+
 function Get-WssToolDefinitions {
-    param([bool]$IncludeWrite = $false, [bool]$AllowOverwrite = $false)
+    param([bool]$IncludeWrite = $false, [bool]$AllowOverwrite = $false, [bool]$IncludeOutputSchema = $false)
     $serverProp = @{ type = 'string'; description = 'Restrict to one server (name as returned by list_servers). Default: all servers.' }
-    return @(
+    $tools = @(
         [ordered]@{
             name        = 'list_servers'
             title       = 'List Windows servers'
@@ -2191,7 +2928,7 @@ function Get-WssToolDefinitions {
         [ordered]@{
             name        = 'search_files'
             title       = 'Search Windows server index'
-            description = 'Searches the Windows Search index of the Windows file server(s) for files by content and/or file name, with optional filters. Results include UNC path, mapped drive path, size, dates, author and relevance rank. Files blocked by the access policy are never returned; hidden_by_policy reports how many were withheld. Query syntax: words are ANDed (prefix match), "exact phrase", -exclude, OR between terms.'
+            description = 'Searches the Windows Search index of the Windows file server(s) for files by content and/or file name, with optional filters. Results include UNC path, mapped drive path, size, dates (UTC), author and relevance rank; snippets=true adds the text around the match for the first results. Files blocked by the access policy are never returned; hidden_by_policy reports how many were withheld. Query syntax: words are ANDed (prefix match), "exact phrase", -exclude, OR between terms. More results: pass next_offset as offset.'
             inputSchema = [ordered]@{
                 type       = 'object'
                 properties = [ordered]@{
@@ -2202,11 +2939,13 @@ function Get-WssToolDefinitions {
                     extensions      = @{ type = 'array'; items = @{ type = 'string' }; description = 'File extensions to include, e.g. ["pdf","docx"].' }
                     kind            = @{ type = 'string'; description = 'Windows kind filter, e.g. document, picture, music, video, email, folder, program.' }
                     author          = @{ type = 'string'; description = 'Exact document author.' }
-                    modified_after  = @{ type = 'string'; description = 'ISO date/time (UTC), e.g. 2024-01-01' }
-                    modified_before = @{ type = 'string'; description = 'ISO date/time (UTC), e.g. 2024-12-31T23:59:59Z' }
+                    modified_after  = @{ type = 'string'; description = 'ISO date or date/time, e.g. 2024-01-01 or 2024-01-01T08:00. Without Z or an offset it is the local time of this PC.' }
+                    modified_before = @{ type = 'string'; description = 'ISO date or date/time; a plain date (2024-12-31) includes that whole day. Without Z or an offset it is the local time of this PC.' }
                     include_folders = @{ type = 'boolean'; default = $false; description = 'Also return folders.' }
                     sort            = @{ type = 'string'; enum = @('relevance', 'modified', 'name', 'size'); default = 'relevance' }
                     max_results     = @{ type = 'integer'; minimum = 1; maximum = 500; description = 'Maximum results (default from configuration, 50).' }
+                    offset          = @{ type = 'integer'; minimum = 0; maximum = 4500; default = 0; description = 'Skip this many results (paging): pass next_offset from the previous search.' }
+                    snippets        = @{ type = 'boolean'; default = $false; description = 'Read the first 10 results and add the text around the first match (snippet). Slower; use when you need to judge which results are relevant.' }
                 }
             }
             annotations = @{ readOnlyHint = $true; openWorldHint = $false }
@@ -2214,13 +2953,16 @@ function Get-WssToolDefinitions {
         [ordered]@{
             name        = 'read_file'
             title       = 'Read file from Windows server'
-            description = 'Reads the text content of a file on a known Windows server share (UNC or mapped drive path). Supports plain-text formats and .docx/.xlsx/.pptx. Long files are returned in chunks; use offset/next_offset to continue.'
+            description = 'Reads the text content of a file on a known Windows server share (UNC or mapped drive path): plain-text formats, .docx/.xlsx/.pptx (spreadsheets as tab-separated rows with row numbers, real sheet names and dates), and other formats such as PDF, .doc, .xls, .rtf or .msg when Windows has a filter for them. Long files are returned in chunks; use offset/next_offset to continue. To find something in a long file, pass find: only the matching passages are returned, with their offsets.'
             inputSchema = [ordered]@{
                 type       = 'object'
                 properties = [ordered]@{
                     path      = @{ type = 'string'; description = 'UNC path (\\server\share\dir\file.txt) or mapped drive path (Z:\dir\file.txt).' }
                     offset    = @{ type = 'integer'; minimum = 0; default = 0; description = 'Character offset to start reading from.' }
                     max_chars = @{ type = 'integer'; minimum = 1; maximum = 200000; default = 20000; description = 'Maximum characters to return.' }
+                    find        = @{ type = 'string'; description = 'Return only passages containing this text (case-insensitive; line breaks count as spaces; "a OR b" for alternatives) instead of the content.' }
+                    context     = @{ type = 'integer'; minimum = 0; maximum = 20; default = 2; description = 'With find: lines before and after each match.' }
+                    max_matches = @{ type = 'integer'; minimum = 1; maximum = 200; default = 20; description = 'With find: maximum passages.' }
                 }
                 required   = @('path')
             }
@@ -2280,6 +3022,11 @@ function Get-WssToolDefinitions {
             }
             annotations = @{ readOnlyHint = $false; destructiveHint = $AllowOverwrite; idempotentHint = $false; openWorldHint = $false }
         }) } else { @() })
+    if ($IncludeOutputSchema) {
+        $schemas = Get-WssOutputSchemas
+        foreach ($t in $tools) { if ($schemas.ContainsKey($t.name)) { $t.outputSchema = $schemas[$t.name] } }
+    }
+    return $tools
 }
 
 function ConvertTo-WssHashtable {
@@ -2348,18 +3095,19 @@ function Invoke-WssRequest {
             $requested = "$($params.protocolVersion)"
             $version = $script:SupportedProtocolVersions[0]
             if ($script:SupportedProtocolVersions -contains $requested) { $version = $requested }
+            $script:ProtocolVersion = $version
             return New-WssResponse $id ([ordered]@{
                     protocolVersion = $version
                     capabilities    = [ordered]@{ tools = [ordered]@{ listChanged = $false } }
                     serverInfo      = [ordered]@{ name = $script:ServerName; title = 'Windows Server Search'; version = $script:ServerVersion }
-                    instructions    = 'Search files on Windows file servers through their Windows Search index. Call list_servers first to see available servers/shares, then search_files; use read_file to read results as text, or copy_file to copy files into your workspace (e.g. PDFs or images). Some paths may be blocked by an access policy: report hidden_by_policy counts to the user and never try to work around a block.'
+                    instructions    = 'Search files on Windows file servers through their Windows Search index. Call list_servers first to see available servers/shares, then search_files; use read_file to read results as text (read_file with find returns only the matching passages of a long file), or copy_file to copy files into your workspace (e.g. images, or files read_file cannot convert). Some paths may be blocked by an access policy: report hidden_by_policy counts to the user and never try to work around a block.'
                 })
         }
         'ping' { return New-WssResponse $id @{} }
         'tools/list' {
             $cfg = Get-WssConfig
             $ws = Get-WssWriteStatus $cfg
-            return New-WssResponse $id ([ordered]@{ tools = @(Get-WssToolDefinitions -IncludeWrite $ws.enabled -AllowOverwrite $ws.allow_overwrite) })
+            return New-WssResponse $id ([ordered]@{ tools = @(Get-WssToolDefinitions -IncludeWrite $ws.enabled -AllowOverwrite $ws.allow_overwrite -IncludeOutputSchema (Test-WssStructuredOutput)) })
         }
         'tools/call' {
             $name = $params.name
@@ -2370,7 +3118,11 @@ function Invoke-WssRequest {
             try {
                 $result = Invoke-WssTool -Name $name -Arguments $toolArgs
                 $text = ConvertTo-Json -InputObject $result -Depth 30
-                return New-WssResponse $id ([ordered]@{ content = @([ordered]@{ type = 'text'; text = $text }); isError = $false })
+                $response = [ordered]@{ content = @([ordered]@{ type = 'text'; text = $text }) }
+                # The text block repeats the result for clients that don't read structuredContent.
+                if (Test-WssStructuredOutput) { $response.structuredContent = $result }
+                $response.isError = $false
+                return New-WssResponse $id $response
             } catch {
                 Write-WssLog "Tool $name failed: $($_.Exception.Message)"
                 return New-WssResponse $id ([ordered]@{ content = @([ordered]@{ type = 'text'; text = "Error: $($_.Exception.Message)" }); isError = $true })
@@ -2418,12 +3170,14 @@ function Enable-WssFakeBackend {
       { "mappedDrives": [{"drive":"Z:","unc":"\\\\srv\\share"}],
         "shares": {"srv2": ["a","b"]},
         "results": {"SRV": [ {"System.ItemUrl": "...", ...} ]},
-        "errors": {"SRV3": "message"} }
+        "errors": {"SRV3": "message"},
+        "delays": {"SRV": 1500} }   (milliseconds per query)
       Every executed SQL statement is appended to $env:WSS_FAKE_SQL_LOG when set.
     #>
     param([string]$Path)
     $data = ConvertTo-WssHashtable (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json)
     $script:FakeData = $data
+    $script:FakeBackendPath = $Path
     $script:DriveProvider = {
         $out = @()
         if ($script:FakeData.mappedDrives) { foreach ($d in $script:FakeData.mappedDrives) { $out += @{ Drive = $d.drive; Unc = $d.unc } } }
@@ -2450,7 +3204,13 @@ function Enable-WssFakeBackend {
     }
     $script:QueryExecutor = {
         param($Machine, $Sql, $Timeout)
-        if ($env:WSS_FAKE_SQL_LOG) { Add-Content -LiteralPath $env:WSS_FAKE_SQL_LOG -Value "$Machine`t$Sql" -Encoding UTF8 }
+        if ($script:FakeData.delays) { foreach ($k in $script:FakeData.delays.Keys) { if ($k -ieq $Machine) { Start-Sleep -Milliseconds ([int]$script:FakeData.delays[$k]) } } }
+        if ($env:WSS_FAKE_SQL_LOG) {
+            # Several runspaces may log at once.
+            for ($try = 0; $try -lt 20; $try++) {
+                try { [IO.File]::AppendAllText($env:WSS_FAKE_SQL_LOG, "$Machine`t$Sql`r`n", (New-Object Text.UTF8Encoding($false))); break } catch { Start-Sleep -Milliseconds 25 }
+            }
+        }
         if ($script:FakeData.errors) { foreach ($k in $script:FakeData.errors.Keys) { if ($k -ieq $Machine) { throw $script:FakeData.errors[$k] } } }
         if ($script:FakeData.results) { foreach ($k in $script:FakeData.results.Keys) { if ($k -ieq $Machine) { return @($script:FakeData.results[$k]) } } }
         return @()

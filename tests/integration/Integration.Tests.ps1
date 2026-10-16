@@ -359,3 +359,57 @@ Describe 'Write protection defaults' -Skip:$Skip {
         }
     }
 }
+
+Describe 'Reading documents on the share on <Name>' -Skip:$Skip -ForEach $Hosts {
+    BeforeAll {
+        $script:DocDir = Join-Path $Env.Folder ('docs-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        New-Item -ItemType Directory -Path $DocDir -Force | Out-Null
+        $rel = Split-Path $DocDir -Leaf
+        Add-Type -AssemblyName System.IO.Compression
+        $fs = [IO.File]::Create((Join-Path $DocDir 'sheet.xlsx'))
+        $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Create)
+        $parts = @{
+            'xl/workbook.xml'            = '<workbook xmlns:r="r"><sheets><sheet name="Budget" r:id="rId1"/></sheets></workbook>'
+            'xl/_rels/workbook.xml.rels' = '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>'
+            'xl/styles.xml'              = '<styleSheet><cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>'
+            'xl/worksheets/sheet1.xml'   = '<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Item</t></is></c><c r="C1" t="inlineStr"><is><t>Due</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Server</t></is></c><c r="C2" s="1"><v>45658</v></c></row></sheetData></worksheet>'
+        }
+        foreach ($k in $parts.Keys) { $w = New-Object IO.StreamWriter($zip.CreateEntry($k).Open()); $w.Write($parts[$k]); $w.Dispose() }
+        $zip.Dispose(); $fs.Dispose()
+        Set-Content -LiteralPath (Join-Path $DocDir 'memo.rtf') -Value '{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs20 Hello from \b RTF\b0 memo.\par}' -Encoding ASCII
+        Set-Content -LiteralPath (Join-Path $DocDir 'long.txt') -Value (@(1..400 | ForEach-Object { "filler line $_" }) + 'the indemnity cap is 2 million' + @(1..400 | ForEach-Object { "more $_" })) -Encoding UTF8
+        $script:RtfFilter = [bool](Get-ItemProperty -LiteralPath 'Registry::HKEY_CLASSES_ROOT\.rtf\PersistentHandler' -ErrorAction SilentlyContinue)
+        $script:Docs = @(Invoke-Mcp $Exe @(
+                (Call 1 'read_file' @{ path = "$($Env.Drive)\$rel\sheet.xlsx" }),
+                (Call 2 'read_file' @{ path = "$($Env.Drive)\$rel\memo.rtf" }),
+                (Call 3 'read_file' @{ path = "$($Env.Drive)\$rel\long.txt"; find = 'indemnity  cap'; context = 1 }),
+                (Call 4 'search_files' @{ query = "quarterly $($Env.Token)"; snippets = $true })
+            ))
+    }
+    AfterAll { Remove-Item -LiteralPath $DocDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'reads spreadsheets with sheet names, row numbers, columns and dates' {
+        $r = Get-ToolJson ($Docs | Where-Object id -eq 1)
+        $r.content | Should -Match '--- Sheet: Budget ---'
+        $r.content | Should -Match "2`tServer`t`t2025-01-01"
+    }
+    It 'reads RTF as plain text through the Windows filter' {
+        if (-not $RtfFilter) { Set-ItResult -Skipped -Because 'no RTF filter registered on this runner'; return }
+        $r = Get-ToolJson ($Docs | Where-Object id -eq 2)
+        $r.content | Should -Match 'Hello from RTF memo'
+        $r.content | Should -Not -Match '\\rtf1'
+    }
+    It 'returns only the matching passage with find' {
+        $r = Get-ToolJson ($Docs | Where-Object id -eq 3)
+        $r.match_count | Should -Be 1
+        $r.passages[0].line | Should -Be 400
+        $r.passages[0].text | Should -Be "filler line 400`nthe indemnity cap is 2 million`nmore 1"
+        $r.PSObject.Properties.Name | Should -Not -Contain 'content'
+    }
+    It 'adds snippets to search results and returns structured content' {
+        $m = $Docs | Where-Object id -eq 4
+        $m.result.structuredContent.result_count | Should -BeGreaterThan 0
+        $alpha = @($m.result.structuredContent.results | Where-Object { $_.drive_path -eq "$($Env.Drive)\alpha.txt" })
+        $alpha[0].snippet | Should -Match ([regex]::Escape("quarterly report mentions $($Env.Token)"))
+    }
+}

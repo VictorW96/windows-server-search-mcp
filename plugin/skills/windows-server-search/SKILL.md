@@ -20,12 +20,28 @@ The `windows-server-search` MCP server queries the **Windows Search index of the
    - Narrow with `path` (`Z:\Projects\Alpha` or `\\server\share\folder`), `extensions` (`["pdf","docx"]`),
      `kind` (`document`, `picture`, `email`, …), `author`, `modified_after` / `modified_before` (ISO dates).
    - A query is optional when filters are given (e.g. all `.pptx` modified this month, `sort: "modified"`).
-3. **`read_file`** – read text of a result (plain text, csv, code, `.docx`, `.xlsx`, `.pptx`).
-   Long files come in chunks; continue with `offset: next_offset`.
+   - **Codes, numbers and names** (`PRJ-2024-017`, `INV 4711`, a customer name): try `match: "filename"` first;
+     full-text prefix matching on such terms finds many unrelated documents. Widen to `match: "all"` if needed.
+   - **"What changed recently?"**: no query, `modified_after` (e.g. 7 days ago), `sort: "modified"`, and `path`
+     or `extensions` to narrow it. Plain dates and times without `Z` are the user's local time;
+     `modified_before: 2024-12-31` includes that day. Result dates are UTC: convert them when you show them.
+   - **`snippets: true`** adds the text around the match to the first 10 results. Use it when you have to pick
+     the right document from several similar hits, instead of reading each one.
+   - **More results:** when the response has `next_offset`, call again with `offset: next_offset`.
+3. **`read_file`** – read text of a result: plain text, csv, code, `.docx`, `.xlsx`, `.pptx`, and through
+   Windows filters also PDF, `.doc`, `.xls`, `.ppt`, `.rtf`, `.msg` where the PC has a filter for them.
+   - Long files come in chunks; continue with `offset: next_offset`.
+   - **Looking for something specific in a long file** (a clause, a figure, a name): pass `find` instead of
+     paging through it. You get only the matching passages with their `line` and `offset`; read on from a
+     passage with `offset`. `find` ignores case and line breaks; `"a OR b"` finds either.
+   - Spreadsheets come as one block per sheet (`--- Sheet: name ---`), one line per row starting with the row
+     number, cells tab-separated in their columns (empty cells stay empty), so "C12" is row 12, third cell.
+   - If a format can't be read (no filter on this PC, scanned PDF without text), use `copy_file` and work with
+     the file in the workspace.
 4. **`list_directory`** – browse a folder around a result.
 5. **`copy_file`** – copy files from the server into your workspace when you need the real file:
-   PDFs, images, legacy `.doc`/`.xls`, or anything you want to process with your own tools
-   (e.g. analysing a large spreadsheet with code). In **Cowork**, the MCP server runs on Windows and
+   images, files `read_file` can't convert, or anything you want to process with your own tools
+   (e.g. analysing a large spreadsheet with code, or a scanned PDF). In **Cowork**, the MCP server runs on Windows and
    does not know the Windows path of your workspace folder, so:
    1. create an empty marker file whose name starts with `.wss-` followed by at least 8 random characters,
       e.g. `.wss-target-7f3k9q2m`, in your workspace folder (the folder connected to this session);

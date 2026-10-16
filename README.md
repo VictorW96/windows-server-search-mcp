@@ -34,14 +34,43 @@ so the server sees your mapped drives and Windows credentials.
 | Tool | Purpose |
 |---|---|
 | `list_servers` | Servers/shares available (discovered + configured) with drive letters; `check: true` tests each index |
-| `search_files` | Index search: `query` (words, `"phrases"`, `-exclude`, `OR`), `match` (all/filename/contents), `server`, `path` (`Z:\folder` or UNC), `extensions`, `kind`, `author`, `modified_after/before`, `sort`, `max_results` |
-| `read_file` | Text of a file on a known share: text formats, `.docx`, `.xlsx`, `.pptx`; chunked via `offset` |
+| `search_files` | Index search: `query` (words, `"phrases"`, `-exclude`, `OR`), `match` (all/filename/contents), `server`, `path` (`Z:\folder` or UNC), `extensions`, `kind`, `author`, `modified_after/before`, `sort`, `max_results`, `offset` (paging via `next_offset`), `snippets` (text around the match for the first 10 results) |
+| `read_file` | Text of a file on a known share, chunked via `offset`; with `find`, only the matching passages (with line numbers and offsets). Formats: see [Reading files](#reading-files) |
 | `list_directory` | Folder listing on a known share |
 | `copy_file` | Copies one or more files (any format) from a share to a **local** folder, e.g. the Cowork workspace, so Claude can work on PDFs, images and spreadsheets with its own tools |
 
 `read_file`, `list_directory` and `copy_file` only accept source paths inside the discovered or configured shares.
 
+Dates in results are UTC (`…Z`). `modified_after` / `modified_before` accept dates and times with `Z` or an offset;
+without one they mean the local time of the PC, and a plain date covers that whole day
+(`modified_before: 2024-12-31` includes 31 December).
+
+For clients on MCP protocol 2025-06-18 or newer, every tool declares an `outputSchema` and returns its result as
+`structuredContent` as well as JSON text.
+
 | `save_file` | Saves text (`content`) or workspace files to a server folder (on by default, can be disabled). No delete, move or rename |
+
+### Reading files
+
+- **Text formats** (`.txt`, `.csv`, `.md`, code, …) as they are; UTF-8, UTF-16 and BOMs are detected.
+- **Word** (`.docx`, `.docm`, `.dotx`): body text, tables (cells tab-separated, one row per line), headers and
+  footers, footnotes, endnotes and comments (with author). Deleted tracked changes and field codes are left out.
+- **Excel** (`.xlsx`, `.xlsm`, `.xltx`): one block per sheet with its real name, in workbook order (hidden sheets
+  are marked), one line per row starting with the row number. Empty cells keep their column, so values stay
+  under their headers. Dates, times, durations, percentages and booleans are shown as such, not as raw numbers.
+- **PowerPoint** (`.pptx`, `.ppsx`, `.potx`): slides in presentation order, with speaker notes.
+- **Everything else through Windows filters (IFilter):** the components Windows Search itself uses to read
+  file contents. Windows ships filters for legacy Office files (`.doc`, `.xls`, `.ppt`), `.rtf`, `.eml`/`.mht`
+  and more; PDF needs a PDF filter, which Adobe Acrobat Reader and other PDF readers install; Outlook adds
+  `.msg`. If a format has no filter on the PC, `read_file` says so and suggests `copy_file`. Scanned PDFs without
+  a text layer have no text to read.
+  Filters run inside the MCP server process on their own thread with a time limit (`filterTimeout`, 60 s).
+  Windows Search runs them in an isolated host process instead; if you'd rather not run them in-process,
+  set `"useIFilter": false` in the config file (or `WSS_USE_IFILTER=false`).
+
+`find` in `read_file` searches the whole extracted text: case-insensitive, line breaks count as spaces, and
+`a OR b` finds either. Each passage has the matching line(s) plus `context` lines around them, its line
+number, and its `offset`, which `read_file` accepts to read on from there.
 
 ### Writing to servers (`save_file`, on by default)
 
@@ -154,9 +183,9 @@ reg add HKLM\SOFTWARE\Policies\WindowsServerSearchMcp /v DenyPaths /t REG_MULTI_
 - **Fail closed:** if a share's `.claude-policy` exists but can't be read or parsed, that whole share is
   blocked, and `list_servers` explains why. If your own `.claude-policy` can't be read or parsed, all shares
   are blocked. A single pattern that can't be used (e.g. an unmapped drive letter) is only reported.
-- **Search filtering:** search examines `3 × max_results + 20` index hits, and up to 5000 if needed, so
-  blocked files don't crowd out allowed ones. `hidden_by_policy` counts the blocked hits among those
-  examined.
+- **Search filtering:** search first examines `3 × (offset + max_results + 1) + 20` index hits per server (at
+  most 2000). If blocked files crowd out the allowed ones, it asks the index for more, up to 5000 hits.
+  `hidden_by_policy` counts the blocked hits among those examined.
 - **`list_servers`** shows the active rules per source, the policy files it found, and any blocked shares.
 
 - **Known shares only:** the `path` filter of `search_files` must lie inside a discovered or configured share.
@@ -211,7 +240,10 @@ All settings are optional. A PC with mapped network drives works without any con
 | Allow overwriting files | `write.allowOverwrite` / `WSS_WRITE_OVERWRITE` | `true` | `overwrite: true` replaces files (with backup); `false` = numbered copies only |
 | – | `write.maxMB` / `WSS_WRITE_MAX_MB` | `100` | Maximum size per written file |
 | – | `write.logPath` / `WSS_WRITE_LOG` | `%LOCALAPPDATA%\windows-server-search-mcp\write-log.jsonl` | Write audit log |
-| – | `queryTimeout` / `WSS_QUERY_TIMEOUT` | `30` | Seconds per index query |
+| – | `queryTimeout` / `WSS_QUERY_TIMEOUT` | `30` | Seconds per index query. Several servers are queried in parallel |
+| – | `discoveryTtl` / `WSS_DISCOVERY_TTL` | `60` | Seconds to reuse the discovered servers and shares between tool calls; `list_servers` always rediscovers. `0` = discover on every call |
+| – | `useIFilter` / `WSS_USE_IFILTER` | `true` | Read PDF, `.doc`, `.rtf`, `.msg` … through Windows filters, see [Reading files](#reading-files) |
+| – | `filterTimeout` / `WSS_FILTER_TIMEOUT` | `60` | Seconds per Windows filter run |
 | – | `useNetBios` / `WSS_USE_NETBIOS` | `true` | Query FQDN hosts by their NetBIOS name, which Windows Search requires |
 | – | `WSS_CONFIG_FILE` | `%APPDATA%\windows-server-search-mcp\config.json` | JSON file with `servers`, `exclude`, `autoDiscover`, `maxResults`, …; the user's `.claude-policy` is read from the same folder |
 
@@ -236,12 +268,14 @@ scripts/           build.sh, release.sh, update_marketplace.py
 
 Most of us have no Windows file server at hand, so the tests run in three layers:
 
-1. **Unit tests** (`tests/WindowsServerSearch.Tests.ps1`): config parsing, drive/share discovery
-   (backend injected), `net view` parsing (English and German), SQL generation and escaping,
-   path resolution and traversal protection, Office text extraction, and the MCP protocol.
+1. **Unit tests** (`tests/WindowsServerSearch.Tests.ps1`): config parsing, drive/share discovery and its
+   cache (backend injected), `net view` parsing (English and German), SQL generation and escaping, date
+   filters, paging, path resolution and traversal protection, Office text extraction (sparse spreadsheet rows,
+   number formats, Word tables and notes, slide order), Windows filter handling (extractor injected),
+   `find` passages, snippets, and the MCP protocol including structured output.
 2. **stdio end-to-end** (`tests/StdioServer.Tests.ps1`): launches `server.ps1` as a process and speaks
    JSON-RPC over stdin/stdout against a fake backend (`WSS_FAKE_BACKEND=fake.json`, SQL logged to
-   `WSS_FAKE_SQL_LOG`).
+   `WSS_FAKE_SQL_LOG`). With four slow fake servers (`delays`), it checks that they are queried in parallel.
 3. **Real Windows Search** (`tests/integration`, CI on `windows-2022` / `windows-2025`): the runner acts as
    its own file server. `Setup-WindowsSearch.ps1` enables `WSearch`, creates test files, adds them to the
    crawl scope over COM, shares the folder over SMB and maps it as drive `W:`. The tests then start the real
@@ -258,14 +292,17 @@ Most of us have no Windows file server at hand, so the tests run in three layers
    executables, blocked folders, `.claude-policy`, foreign local sources and non-share targets are refused,
    that every write is logged, that the tool is available by default and hidden when disabled, and that the
    Group Policy veto works.
+   A second session reads a spreadsheet, an RTF file (through the real Windows filter, when the runner has one)
+   and a long text file with `find` from the share, and checks search snippets and structured output.
 
 Run locally (any OS with PowerShell 7 or Docker):
 
 ```bash
 pwsh -c 'Invoke-Pester ./tests -Output Detailed'
-# or
-docker run --rm -v "$PWD":/w -w /w mcr.microsoft.com/powershell \
-  pwsh -c 'Install-Module Pester -Force; Invoke-Pester ./tests -Output Detailed'
+# or in Docker; the .NET SDK image includes pwsh and also runs natively on Apple Silicon
+# (mcr.microsoft.com/powershell is amd64-only and crashes under emulation there)
+docker run --rm -v "$PWD":/w -w /w mcr.microsoft.com/dotnet/sdk:8.0 \
+  pwsh -c 'Install-Module Pester -MinimumVersion 5.5.0 -Force; Invoke-Pester ./tests -Output Detailed'
 ```
 
 To try it on a real Windows PC with mapped drives:

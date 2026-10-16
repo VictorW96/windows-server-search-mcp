@@ -12,7 +12,7 @@ BeforeAll {
         results      = @{ fs01 = @(@{ 'System.ItemUrl' = 'file://fs01/projects/Ünïcode report.docx'; 'System.FileName' = 'Ünïcode report.docx'; 'System.Size' = 42; 'System.Search.Rank' = 1000 }) }
     } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Fake -Encoding UTF8
 
-    function Invoke-Server([string[]]$Lines) {
+    function Invoke-Server([string[]]$Lines, [string]$FakeFile = $Fake) {
         # Prefer the host that runs the tests (powershell.exe on 5.1, pwsh otherwise)
         $exe = (Get-Process -Id $PID).Path
         $psi = New-Object Diagnostics.ProcessStartInfo
@@ -25,7 +25,7 @@ BeforeAll {
         $utf8 = New-Object Text.UTF8Encoding($false)
         $psi.StandardOutputEncoding = $utf8
         $psi.StandardErrorEncoding = $utf8
-        $psi.EnvironmentVariables['WSS_FAKE_BACKEND'] = $Fake
+        $psi.EnvironmentVariables['WSS_FAKE_BACKEND'] = $FakeFile
         $psi.EnvironmentVariables['WSS_FAKE_SQL_LOG'] = $SqlLog
         $psi.EnvironmentVariables['WSS_SERVERS'] = ''
         $p = [Diagnostics.Process]::Start($psi)
@@ -60,5 +60,28 @@ Describe 'stdio server (fake backend)' {
         $search.results[0].name | Should -Be 'Ünïcode report.docx'
         $search.results[0].drive_path | Should -Be 'Z:\Ünïcode report.docx'
         Get-Content -LiteralPath $SqlLog -Raw | Should -Match "FROM fs01\.SystemIndex WHERE SCOPE='file://fs01/projects'"
+    }
+    It 'queries several servers in parallel' {
+        $multi = Join-Path $Tmp 'multi.json'
+        $data = @{ mappedDrives = @(); results = @{}; delays = @{}; errors = @{ fs04 = 'boom (error 0x80040E37)' } }
+        foreach ($n in 1..4) {
+            $data.mappedDrives += @{ drive = "$([char](86 + $n)):"; unc = "\\fs0$n\data" }
+            $data.results["fs0$n"] = @(@{ 'System.ItemUrl' = "file://fs0$n/data/r$n.txt"; 'System.FileName' = "r$n.txt"; 'System.Search.Rank' = 10 * $n })
+            $data.delays["fs0$n"] = 3000
+        }
+        $data | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $multi -Encoding UTF8
+        $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"pester","version":"1"}}}'
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $null = Invoke-Server @($init, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_servers","arguments":{}}}') -FakeFile $multi
+        $baseline = $sw.ElapsedMilliseconds
+        $sw.Restart()
+        $lines = Invoke-Server @($init, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_files","arguments":{"query":"r"}}}') -FakeFile $multi
+        $elapsed = $sw.ElapsedMilliseconds
+        $search = ($lines[1] | ConvertFrom-Json).result.structuredContent
+        @($search.results.name) | Should -Be @('r3.txt', 'r2.txt', 'r1.txt') -Because "stderr was: $LastStderr"
+        @($search.errors).Count | Should -Be 1
+        $search.errors[0].server | Should -Be 'fs04'
+        $search.errors[0].error | Should -Match '0x80040E37.*Hint'
+        ($elapsed - $baseline) | Should -BeLessThan 8000 -Because "4 servers x 3 s run in parallel (one after another: 12 s); baseline $baseline ms, search $elapsed ms"
     }
 }
