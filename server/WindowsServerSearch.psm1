@@ -57,6 +57,81 @@ function Test-WssIsWindows {
 }
 
 # ---------------------------------------------------------------------------
+# Process environment
+# ---------------------------------------------------------------------------
+
+$script:RestoredEnv = @()
+
+function Get-WssDefaultEnvironment {
+    <# The variables a normal logon session has: system folders, machine, user and volatile environment. #>
+    $envs = [ordered]@{}
+    $folders = [ordered]@{
+        'windir'            = 'Windows'
+        'SystemRoot'        = 'Windows'
+        'ProgramData'       = 'CommonApplicationData'
+        'ALLUSERSPROFILE'   = 'CommonApplicationData'
+        'CommonProgramFiles' = 'CommonProgramFiles'
+        'ProgramFiles'      = 'ProgramFiles'
+    }
+    foreach ($k in $folders.Keys) {
+        $v = [Environment]::GetFolderPath($folders[$k])
+        if ($v) { $envs[$k] = $v }
+    }
+    if ([Environment]::Is64BitOperatingSystem) {
+        $x86 = [Environment]::GetFolderPath('ProgramFilesX86')
+        $cx86 = [Environment]::GetFolderPath('CommonProgramFilesX86')
+        if ($x86) { $envs['ProgramFiles(x86)'] = $x86 }
+        if ($cx86) { $envs['CommonProgramFiles(x86)'] = $cx86 }
+        try {
+            $cv = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion' -ErrorAction Stop
+            if ($cv.ProgramW6432Dir) { $envs['ProgramW6432'] = $cv.ProgramW6432Dir }
+            if ($cv.CommonW6432Dir) { $envs['CommonProgramW6432'] = $cv.CommonW6432Dir }
+        } catch { }
+    }
+    $envs['COMPUTERNAME'] = [Environment]::MachineName
+    $envs['USERDOMAIN'] = [Environment]::UserDomainName
+    foreach ($scope in 'Machine', 'User') {
+        try {
+            $vars = [Environment]::GetEnvironmentVariables($scope)
+            foreach ($k in $vars.Keys) { $envs["$k"] = "$($vars[$k])" }
+        } catch { }
+    }
+    try {
+        $vol = Get-ItemProperty -LiteralPath 'HKCU:\Volatile Environment' -ErrorAction Stop
+        foreach ($p in $vol.PSObject.Properties) {
+            if ($p.Name -notlike 'PS*' -and $p.Value -is [string]) { $envs[$p.Name] = $p.Value }
+        }
+    } catch { }
+    return $envs
+}
+
+function Restore-WssEnvironment {
+    <# MCP hosts often start servers with a reduced environment (only PATH, SYSTEMROOT, USERPROFILE and a few
+       more). COM components registered as %windir%\... or %CommonProgramFiles%\... then fail with "class not
+       registered". Adds the missing logon variables; variables that are set are never changed. #>
+    param([System.Collections.IDictionary]$Defaults)
+    if (-not $PSBoundParameters.ContainsKey('Defaults')) {
+        if (-not (Test-WssIsWindows)) { return @() }
+        $Defaults = Get-WssDefaultEnvironment
+    }
+    $added = @()
+    foreach ($k in @($Defaults.Keys)) {
+        if ($k -ieq 'Path' -or [string]::IsNullOrEmpty("$($Defaults[$k])")) { continue }
+        if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($k, 'Process'))) {
+            [Environment]::SetEnvironmentVariable($k, "$($Defaults[$k])", 'Process')
+            $added += $k
+        }
+    }
+    foreach ($k in $added) {
+        $v = [Environment]::GetEnvironmentVariable($k, 'Process')
+        if ($v -match '%') { [Environment]::SetEnvironmentVariable($k, [Environment]::ExpandEnvironmentVariables($v), 'Process') }
+    }
+    $script:RestoredEnv = @($added)
+    if ($added.Count -gt 0) { Write-WssLog "restored missing environment variables: $($added -join ', ')" }
+    return $added
+}
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -688,6 +763,7 @@ function Get-WssErrorMessage {
         '0x80040154|0x800401F3|class not registered|Klasse nicht registriert' {
             $bits = ''
             if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $bits = ' This MCP server runs as a 32-bit PowerShell process.' }
+            if ($script:RestoredEnv.Count -gt 0) { $bits += " The app started this server without these environment variables (restored): $($script:RestoredEnv -join ', ')." }
             "Hint: this PC could not run the index query for '$Machine' because a COM class is not registered here (Search.CollatorDSO / ADODB, or a component the query needs). The problem is on this PC, not on the file server.$bits"; break
         }
         '0x80040E31|timeout|time-out|Zeitlimit' {

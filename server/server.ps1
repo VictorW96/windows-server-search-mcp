@@ -10,6 +10,9 @@ Import-Module ([IO.Path]::Combine($here, 'WindowsServerSearch.psm1')) -Force -Di
 $versionFile = [IO.Path]::Combine($here, 'VERSION')
 if (Test-Path -LiteralPath $versionFile) { Set-WssVersion ((Get-Content -LiteralPath $versionFile -Raw).Trim()) }
 
+# Before any COM use: hosts may start this server with a reduced environment.
+[void](Restore-WssEnvironment)
+
 if ($env:WSS_FAKE_BACKEND) { Enable-WssFakeBackend -Path $env:WSS_FAKE_BACKEND }
 
 Start-WssServer

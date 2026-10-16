@@ -272,6 +272,21 @@ Describe 'New-WssSearchSql' {
     }
 }
 
+Describe 'Restore-WssEnvironment' {
+    AfterEach {
+        foreach ($k in 'WSS_TEST_MISSING', 'WSS_TEST_SET', 'WSS_TEST_EXPAND') { [Environment]::SetEnvironmentVariable($k, $null, 'Process') }
+    }
+    It 'adds missing variables, keeps existing ones and expands references' {
+        [Environment]::SetEnvironmentVariable('WSS_TEST_SET', 'keep', 'Process')
+        $added = Restore-WssEnvironment -Defaults ([ordered]@{ WSS_TEST_MISSING = 'C:\Win'; WSS_TEST_SET = 'other'; WSS_TEST_EXPAND = '%WSS_TEST_MISSING%\System32'; Path = 'x' })
+        @($added) | Should -Be @('WSS_TEST_MISSING', 'WSS_TEST_EXPAND')
+        $env:WSS_TEST_MISSING | Should -Be 'C:\Win'
+        $env:WSS_TEST_SET | Should -Be 'keep'
+        $env:WSS_TEST_EXPAND | Should -Be 'C:\Win\System32'
+        $env:Path | Should -Not -Be 'x'
+    }
+}
+
 Describe 'Search-Wss' {
     BeforeEach {
         Set-TestBackend -Drives @(
