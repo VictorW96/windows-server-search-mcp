@@ -376,7 +376,7 @@ Describe 'Reading documents on the share on <Name>' -Skip:$Skip -ForEach $Hosts 
         }
         foreach ($k in $parts.Keys) { $w = New-Object IO.StreamWriter($zip.CreateEntry($k).Open()); $w.Write($parts[$k]); $w.Dispose() }
         $zip.Dispose(); $fs.Dispose()
-        Set-Content -LiteralPath (Join-Path $DocDir 'memo.rtf') -Value '{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs20 Hello from \b RTF\b0 memo.\par}' -Encoding ASCII
+        Set-Content -LiteralPath (Join-Path $DocDir 'memo.rtf') -Value '{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs20 Hello from {\b RTF} memo.\par}' -Encoding ASCII
         Set-Content -LiteralPath (Join-Path $DocDir 'long.txt') -Value (@(1..400 | ForEach-Object { "filler line $_" }) + 'the indemnity cap is 2 million' + @(1..400 | ForEach-Object { "more $_" })) -Encoding UTF8
         $script:RtfFilter = [bool](Get-ItemProperty -LiteralPath 'Registry::HKEY_CLASSES_ROOT\.rtf\PersistentHandler' -ErrorAction SilentlyContinue)
         $script:Docs = @(Invoke-Mcp $Exe @(

@@ -1447,9 +1447,11 @@ function Get-WssDocumentText {
             try { $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Read) }
             catch { throw "'$LiteralPath' is not a valid Office document (it may be password-protected or damaged)." }
             try {
-                if ($ext -like '.do*') { return Get-WssDocxText $zip }
-                if ($ext -like '.p*') { return Get-WssPptxText $zip }
-                return Get-WssXlsxText $zip
+                if ($ext -like '.do*') { $text = Get-WssDocxText $zip }
+                elseif ($ext -like '.p*') { $text = Get-WssPptxText $zip }
+                else { $text = Get-WssXlsxText $zip }
+                # StringBuilder.AppendLine writes CRLF on Windows; return the same text everywhere.
+                return ($text -replace "`r`n", "`n")
             } finally { $zip.Dispose() }
         } finally { $fs.Dispose() }
     }

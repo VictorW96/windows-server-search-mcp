@@ -1275,7 +1275,7 @@ Describe 'Structured tool output' {
         $r = (Invoke-WssMessageLine '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_files","arguments":{"query":"a"}}}' | ConvertFrom-Json).result
         $schema = (& $script:Mod { Get-WssOutputSchemas }).search_files
         foreach ($req in $schema.required) { $r.structuredContent.PSObject.Properties.Name | Should -Contain $req }
-        $r.structuredContent.result_count | Should -BeOfType [long]
+        ($r.structuredContent.result_count -is [int] -or $r.structuredContent.result_count -is [long]) | Should -BeTrue -Because 'ConvertFrom-Json gives [int] on 5.1 and [long] on 7'
         @($r.structuredContent.results).Count | Should -Be 1
         $r.structuredContent.results[0].drive_path | Should -Be 'Z:\a.txt'
     }
