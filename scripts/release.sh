@@ -2,19 +2,22 @@
 # Builds the plugin and publishes it to the marketplace repository.
 #   1. builds dist/windows-server-search
 #   2. tags this repo v<VERSION> and creates a GitHub release with the plugin zip
-#   3. copies the plugin into <marketplace>/plugins/windows-server-search, updates
-#      .claude-plugin/marketplace.json, commits and pushes
+#   3. for every marketplace repository: copies the plugin into
+#      <marketplace>/plugins/windows-server-search, updates .claude-plugin/marketplace.json,
+#      commits and pushes
 #
 # Usage: scripts/release.sh [--marketplace-dir DIR] [--dry-run] [--skip-github-release]
-# Env:   MARKETPLACE_REPO (default VictorW96/agentic-marketplace)
-#        MARKETPLACE_TOKEN (optional; token used to push the marketplace, e.g. in CI)
+#        --marketplace-dir publishes to a local checkout instead of cloning MARKETPLACE_REPOS.
+# Env:   MARKETPLACE_REPOS (space separated; default
+#          "VictorW96/agentic-marketplace PMI-ING/agentic-marketplace")
+#        MARKETPLACE_TOKEN (optional; token used to push the marketplaces, e.g. in CI)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="windows-server-search"
 VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 TAG="v$VERSION"
-MARKETPLACE_REPO="${MARKETPLACE_REPO:-VictorW96/agentic-marketplace}"
+MARKETPLACE_REPOS="${MARKETPLACE_REPOS:-${MARKETPLACE_REPO:-VictorW96/agentic-marketplace PMI-ING/agentic-marketplace}}"
 SOURCE_REPO="${SOURCE_REPO:-VictorW96/windows-server-search-mcp}"
 MP_DIR=""
 DRY_RUN=0
@@ -46,43 +49,56 @@ if [[ $GH_RELEASE == 1 ]]; then
     run gh release upload "$TAG" "$ROOT/dist/$NAME-$VERSION.zip" --repo "$SOURCE_REPO" --clobber
   else
     run gh release create "$TAG" "$ROOT/dist/$NAME-$VERSION.zip" --repo "$SOURCE_REPO" \
-      --title "$NAME $TAG" --notes "Claude plugin $NAME $VERSION. Install via the marketplace https://github.com/$MARKETPLACE_REPO"
+      --title "$NAME $TAG" --notes "Claude plugin $NAME $VERSION. Install via the marketplace https://github.com/${MARKETPLACE_REPOS%% *}"
   fi
 fi
 
-# --- Marketplace -------------------------------------------------------------------
+# --- Marketplaces -----------------------------------------------------------------
 CLEANUP=""
-if [[ -z "$MP_DIR" ]]; then
-  MP_DIR="$(mktemp -d)/marketplace"
-  CLEANUP="$(dirname "$MP_DIR")"
-  if [[ -n "${MARKETPLACE_TOKEN:-}" ]]; then
-    git clone -q "https://x-access-token:${MARKETPLACE_TOKEN}@github.com/$MARKETPLACE_REPO.git" "$MP_DIR"
-  else
-    gh repo clone "$MARKETPLACE_REPO" "$MP_DIR" -- -q
-  fi
-fi
 trap '[[ -n "$CLEANUP" ]] && rm -rf "$CLEANUP"' EXIT
 
-mkdir -p "$MP_DIR/plugins" "$MP_DIR/.claude-plugin"
-rm -rf "$MP_DIR/plugins/$NAME"
-cp -R "$ROOT/dist/$NAME" "$MP_DIR/plugins/$NAME"
+# publish_to_marketplace <checkout dir> <label>
+publish_to_marketplace() {
+  local mp_dir="$1" label="$2"
+  mkdir -p "$mp_dir/plugins" "$mp_dir/.claude-plugin"
+  rm -rf "$mp_dir/plugins/$NAME"
+  cp -R "$ROOT/dist/$NAME" "$mp_dir/plugins/$NAME"
 
-python3 "$ROOT/scripts/update_marketplace.py" "$MP_DIR/.claude-plugin/marketplace.json" \
-  "$MP_DIR/plugins/$NAME/.claude-plugin/plugin.json" "./plugins/$NAME"
+  python3 "$ROOT/scripts/update_marketplace.py" "$mp_dir/.claude-plugin/marketplace.json" \
+    "$mp_dir/plugins/$NAME/.claude-plugin/plugin.json" "./plugins/$NAME"
 
-if command -v claude >/dev/null 2>&1; then claude plugin validate "$MP_DIR"; fi
+  if command -v claude >/dev/null 2>&1; then claude plugin validate "$mp_dir"; fi
 
-cd "$MP_DIR"
-git add -A
-if git diff --cached --quiet; then
-  echo "Marketplace already up to date."
+  (
+    cd "$mp_dir"
+    git add -A
+    if git diff --cached --quiet; then
+      echo "$label already up to date."
+      exit 0
+    fi
+    if [[ -z "$(git config user.email || true)" ]]; then
+      git config user.email "github-actions[bot]@users.noreply.github.com"
+      git config user.name "github-actions[bot]"
+    fi
+    run git commit -q -m "Release $NAME $VERSION" -m "Built from $SOURCE_REPO@$(git -C "$ROOT" rev-parse --short HEAD)"
+    BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo main)"
+    run git push -q origin "HEAD:$BRANCH"
+    echo "Published $NAME $VERSION to $label"
+  )
+}
+
+if [[ -n "$MP_DIR" ]]; then
+  publish_to_marketplace "$MP_DIR" "$MP_DIR"
   exit 0
 fi
-if [[ -z "$(git config user.email || true)" ]]; then
-  git config user.email "github-actions[bot]@users.noreply.github.com"
-  git config user.name "github-actions[bot]"
-fi
-run git commit -q -m "Release $NAME $VERSION" -m "Built from $SOURCE_REPO@$(git -C "$ROOT" rev-parse --short HEAD)"
-BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo main)"
-run git push -q origin "HEAD:$BRANCH"
-echo "Published $NAME $VERSION to $MARKETPLACE_REPO"
+
+CLEANUP="$(mktemp -d)"
+for repo in $MARKETPLACE_REPOS; do
+  dir="$CLEANUP/${repo//\//_}"
+  if [[ -n "${MARKETPLACE_TOKEN:-}" ]]; then
+    git clone -q "https://x-access-token:${MARKETPLACE_TOKEN}@github.com/$repo.git" "$dir"
+  else
+    gh repo clone "$repo" "$dir" -- -q
+  fi
+  publish_to_marketplace "$dir" "$repo"
+done
